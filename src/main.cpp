@@ -535,11 +535,13 @@ uint16_t bleGattReadCallback(uint16_t value_handle, uint8_t *buffer,
   }
 
   if (value_handle == statusHandle) {
-    // Return provisioning status
-    if (buffer && buffer_size >= 1) {
-      buffer[0] = (uint8_t)provStatus;
+    // Return provisioning status as ASCII string (e.g., "0", "1", "2")
+    String statusStr = String((int)provStatus);
+    uint16_t len = statusStr.length();
+    if (buffer && buffer_size >= len) {
+      memcpy(buffer, statusStr.c_str(), len);
     }
-    return 1;
+    return len;
   }
 
   if (value_handle == co2DataHandle) {
