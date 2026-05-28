@@ -22,9 +22,9 @@ spi = busio.SPI(clock=board.GP10, MOSI=board.GP11)
 # Display bus
 display_bus = displayio.FourWire(
     spi,
-    command=board.GP8,
-    chip_select=board.GP9,
-    reset=board.GP12
+    command=board.GP14,
+    chip_select=board.GP13,
+    reset=board.GP15
 )
 
 # GC9A01 display
@@ -32,7 +32,7 @@ display = gc9a01.GC9A01(
     display_bus,
     width=240,
     height=240,
-    backlight_pin=board.GP13
+    backlight_pin=board.GP12
 )
 
 # Main group

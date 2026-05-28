@@ -4,6 +4,7 @@
  *
  * Features:
  * - Smooth breathing animation for CO2 display
+ * - WS2812/NeoPixel ring synchronized with display animation
  * - BLE-based WiFi provisioning
  * - Stores WiFi credentials in flash
  * - Broadcasts CO2 data via BLE every minute
@@ -11,6 +12,7 @@
 
 #include <Arduino.h>
 #include <Arduino_GFX_Library.h>
+#include <Adafruit_NeoPixel.h>
 #include <math.h>
 
 // WiFi and BLE
@@ -27,10 +29,14 @@
 
 #define TFT_SCK 10
 #define TFT_MOSI 11
-#define TFT_CS 9
-#define TFT_DC 8
-#define TFT_RST 12
-#define TFT_BL 13
+#define TFT_CS 13
+#define TFT_DC 14
+#define TFT_RST 15
+#define TFT_BL 12
+
+#define LED_PIN 22
+#define LED_COUNT 24
+#define LED_BRIGHTNESS 90
 
 #define MHZ_TX 0
 #define MHZ_RX 1
@@ -45,6 +51,8 @@ Arduino_GC9A01 *gfx =
     new Arduino_GC9A01(bus, TFT_RST, 0 /* rotation */, true /* IPS */);
 
 Arduino_Canvas *canvas = nullptr;
+Adafruit_NeoPixel ledRing(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+bool ledRingReady = false;
 
 // ============================================================
 // CONFIGURATION
@@ -169,6 +177,63 @@ void getCO2Colors(uint16_t co2, uint8_t *startRGB, uint8_t *endRGB) {
   }
 }
 
+bool getRingAnimationState(int ring, float anim, const uint8_t *startRGB,
+                           const uint8_t *endRGB, float breathSpeed,
+                           uint8_t *ringRGB, float *ringAlpha,
+                           int *animatedRadius) {
+  if (ring < 0 || ring >= NUM_RINGS)
+    return false;
+
+  float wavePhase = (anim * WAVE_SPEED) - (ring * 0.40f);
+  float waveOpacity = cosf(wavePhase);
+  float waveAlphaPeak = waveOpacity > 0 ? waveOpacity * waveOpacity : 0;
+  float waveAlpha = MIN_INTENSITY + (1.0f - MIN_INTENSITY) * waveAlphaPeak;
+
+  if (waveAlpha < 0.001f)
+    return false;
+
+  float tInterp = (float)ring / (NUM_RINGS - 1);
+  interpColor(startRGB, endRGB, tInterp, ringRGB);
+
+  int startRadius = TEXT_RADIUS + ring * 2;
+  int endRadius = 118 - ring * 2;
+  float phase = anim * breathSpeed - ring * PHASE_OFFSET;
+  float wave = 0.5f + 0.5f * sinf(phase);
+
+  *ringAlpha = waveAlpha;
+  *animatedRadius = startRadius + (int)(wave * (endRadius - startRadius));
+  return true;
+}
+
+void updateLedRing(float anim, const uint8_t *startRGB, const uint8_t *endRGB,
+                   float breathSpeed) {
+  if (!ledRingReady)
+    return;
+
+  for (uint16_t i = 0; i < LED_COUNT; i++) {
+    int ring = (i * NUM_RINGS) / LED_COUNT;
+    if (ring >= NUM_RINGS)
+      ring = NUM_RINGS - 1;
+
+    uint8_t ringRGB[3];
+    float alpha = 0.0f;
+    int radius = 0;
+
+    if (!getRingAnimationState(ring, anim, startRGB, endRGB, breathSpeed,
+                               ringRGB, &alpha, &radius)) {
+      ledRing.setPixelColor(i, 0);
+      continue;
+    }
+
+    uint8_t r = (uint8_t)(ringRGB[0] * alpha);
+    uint8_t g = (uint8_t)(ringRGB[1] * alpha);
+    uint8_t b = (uint8_t)(ringRGB[2] * alpha);
+    ledRing.setPixelColor(i, ledRing.Color(r, g, b));
+  }
+
+  ledRing.show();
+}
+
 float getBreathSpeed(uint16_t co2) {
   if (co2 < 600)
     return 0.5f;
@@ -228,6 +293,25 @@ bool saveWifiCredentials(const String &ssid, const String &password) {
 
   Serial.printf("Saved WiFi: SSID=%s\n", ssid.c_str());
   return true;
+}
+
+bool deleteWifiConfig() {
+  if (!LittleFS.begin()) {
+    Serial.println("Failed to mount LittleFS");
+    return false;
+  }
+
+  if (LittleFS.exists(WIFI_CONFIG_FILE)) {
+    LittleFS.remove(WIFI_CONFIG_FILE);
+    Serial.println("✓ WiFi configuration deleted!");
+    Serial.println("✓ Restarting device...");
+    delay(1000);
+    rp2040.reboot();
+    return true;
+  } else {
+    Serial.println("No WiFi config file found");
+    return false;
+  }
 }
 
 // ============================================================
@@ -352,23 +436,14 @@ void drawRing(Arduino_GFX *target, int16_t cx, int16_t cy, int16_t radius,
 void drawBreathingRings(Arduino_GFX *target, float anim, uint8_t *startRGB,
                         uint8_t *endRGB, float breathSpeed) {
   for (int ring = NUM_RINGS - 1; ring >= 0; ring--) {
-    float wavePhase = (anim * WAVE_SPEED) - (ring * 0.40f);
-    float waveOpacity = cosf(wavePhase);
-    float waveAlphaPeak = waveOpacity > 0 ? waveOpacity * waveOpacity : 0;
-    float waveAlpha = MIN_INTENSITY + (1.0f - MIN_INTENSITY) * waveAlphaPeak;
-
-    if (waveAlpha < 0.001f)
-      continue;
-
-    float tInterp = (float)ring / (NUM_RINGS - 1);
     uint8_t radialColor[3];
-    interpColor(startRGB, endRGB, tInterp, radialColor);
+    float waveAlpha = 0.0f;
+    int animatedRadius = 0;
 
-    int startRadius = TEXT_RADIUS + ring * 2;
-    int endRadius = 118 - ring * 2;
-    float phase = anim * breathSpeed - ring * PHASE_OFFSET;
-    float wave = 0.5f + 0.5f * sinf(phase);
-    int animatedRadius = startRadius + (int)(wave * (endRadius - startRadius));
+    if (!getRingAnimationState(ring, anim, startRGB, endRGB, breathSpeed,
+                               radialColor, &waveAlpha, &animatedRadius)) {
+      continue;
+    }
 
     drawRing(target, CENTER_X, CENTER_Y, animatedRadius, radialColor,
              waveAlpha);
@@ -386,6 +461,7 @@ void drawStartupFrame(float anim) {
   float breathSpeed = 0.9f;
 
   drawBreathingRings(target, anim, startRGB, endRGB, breathSpeed);
+  updateLedRing(anim, startRGB, endRGB, breathSpeed);
 
   // Draw "neuma" text centered
   target->setTextColor(WHITE);
@@ -419,6 +495,7 @@ void drawConfigFrame(float anim) {
   float breathSpeed = 0.6f;
 
   drawBreathingRings(target, anim, startRGB, endRGB, breathSpeed);
+  updateLedRing(anim, startRGB, endRGB, breathSpeed);
 
   // Draw "neuma" text centered
   target->setTextColor(WHITE);
@@ -455,6 +532,7 @@ void drawNormalFrame() {
   float breathSpeed = getBreathSpeed(co2Value);
 
   drawBreathingRings(target, tAnim, startRGB, endRGB, breathSpeed);
+  updateLedRing(tAnim, startRGB, endRGB, breathSpeed);
 
   // Draw CO2 text centered
   target->setTextColor(WHITE);
@@ -824,6 +902,12 @@ void setup() {
   Serial1.setRX(MHZ_RX);
   Serial1.begin(9600);
 
+  ledRing.begin();
+  ledRing.setBrightness(LED_BRIGHTNESS);
+  ledRing.clear();
+  ledRing.show();
+  ledRingReady = true;
+
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
 
@@ -880,6 +964,15 @@ void setup() {
 // ============================================================
 
 void loop() {
+  // Check for serial input to reset WiFi
+  if (Serial.available() > 0) {
+    char cmd = Serial.read();
+    if (cmd == 'r' || cmd == 'R') {
+      Serial.println("\n*** RESET WiFi Configuration ***");
+      deleteWifiConfig();
+    }
+  }
+
   if (currentMode == MODE_CONFIG) {
     runConfigMode();
   } else if (currentMode == MODE_NORMAL) {

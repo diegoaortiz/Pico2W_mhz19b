@@ -15,10 +15,10 @@ import framebuf
 # ============================================================
 
 spi = SPI(1, baudrate=40000000, polarity=1, phase=1, sck=Pin(10), mosi=Pin(11))
-dc = Pin(8, Pin.OUT)
-cs = Pin(9, Pin.OUT)
-rst = Pin(12, Pin.OUT)
-bl = Pin(13, Pin.OUT)
+dc = Pin(14, Pin.OUT)
+cs = Pin(13, Pin.OUT)
+rst = Pin(15, Pin.OUT)
+bl = Pin(12, Pin.OUT)
 bl.on()
 
 lcd = gc9a01py.GC9A01(spi, dc=dc, cs=cs, reset=rst)

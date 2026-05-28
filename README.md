@@ -14,10 +14,16 @@ Affichage CO2 avec animation wave sur écran rond 1.28" (240x240).
 |------|----------------|
 | GP10 | SCK |
 | GP11 | MOSI |
-| GP8  | DC |
-| GP9  | CS |
-| GP12 | RST |
-| GP13 | BL |
+| GP13 | CS |
+| GP14 | DC |
+| GP15 | RST |
+| GP12 | BL |
+
+| Pico | LED ring / WS2812 |
+|------|-------------------|
+| GP22 | DIN |
+| 5V   | 5V |
+| GND  | GND |
 
 | Pico | MH-Z19B |
 |------|---------|
@@ -25,6 +31,8 @@ Affichage CO2 avec animation wave sur écran rond 1.28" (240x240).
 | GP1  | RX |
 | 5V   | VIN |
 | GND  | GND |
+
+> Le firmware Arduino/PlatformIO utilise `Adafruit NeoPixel` pour le ruban LED. Ajuster `LED_COUNT` dans `src/main.cpp` si l'anneau n'a pas 24 LEDs.
 
 ## Flash Instructions
 
