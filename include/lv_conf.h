@@ -1,5 +1,5 @@
 /*
- * Minimal LVGL v9 configuration for neuma mini (Pico 2W + GC9A01).
+ * Minimal LVGL v9 configuration for alba (Pico 2W + GC9A01).
  * Only the options we deviate from are set here; every other LVGL option
  * falls back to its built-in default (see lv_conf_internal.h).
  *
@@ -23,17 +23,25 @@
 /*=========================
    MEMORY
  *=========================*/
-#define LV_MEM_SIZE (48 * 1024U)
+#define LV_MEM_SIZE (64 * 1024U)
 
 /*====================
    HAL / REFRESH
  *====================*/
 #define LV_DEF_REFR_PERIOD 16 /* ~60 Hz refresh attempts */
 
+/*========================
+   RENDERING
+ *========================*/
+#define LV_USE_DRAW_SW_COMPLEX_GRADIENTS 1 /* enable radial gradients */
+#define LV_GRADIENT_MAX_STOPS 4
+
 /*=======================
    LOG / DEBUG
  *=======================*/
-#define LV_USE_LOG 0
+#define LV_USE_LOG 1
+#define LV_LOG_LEVEL LV_LOG_LEVEL_WARN
+#define LV_LOG_PRINTF 0 /* routed to Serial via lv_log_register_print_cb */
 
 /*==================
    FONTS

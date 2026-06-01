@@ -59,8 +59,8 @@ Pour le tout premier flash : maintenir **BOOTSEL**, brancher l'USB, relâcher qu
 
 À la première mise sous tension (ou après un reset), si aucun identifiant WiFi n'est enregistré, l'appareil démarre un **point d'accès ouvert** et un **portail captif** :
 
-1. L'écran affiche `Config WiFi`, le nom du réseau (`neuma-XXXXXX`) et l'IP (`192.168.4.1`).
-2. Sur un téléphone/PC, rejoindre le réseau WiFi **`neuma-XXXXXX`** (ouvert, sans mot de passe).
+1. L'écran affiche `Config WiFi`, le nom du réseau (`alba-XXXXXX`) et l'IP (`192.168.4.1`).
+2. Sur un téléphone/PC, rejoindre le réseau WiFi **`alba-XXXXXX`** (ouvert, sans mot de passe).
 3. La page de configuration s'ouvre automatiquement (sinon aller sur `http://192.168.4.1`).
 4. Choisir son réseau dans la liste scannée, saisir le mot de passe, **Connecter**.
 5. L'appareil enregistre les identifiants (LittleFS) et redémarre connecté.

@@ -19,6 +19,7 @@
 #include <lvgl.h>
 #include <Arduino_GFX_Library.h>
 #include <Adafruit_NeoPixel.h>
+#include <SerialPIO.h>
 #include <math.h>
 
 // WiFi + captive portal + storage
@@ -42,8 +43,12 @@
 #define LED_COUNT 24
 #define LED_BRIGHTNESS 90
 
-#define MHZ_TX 0
-#define MHZ_RX 1
+// MH-Z19 on GP6 / GP7. These pins are NOT on a hardware UART, so we drive a
+// PIO-emulated serial port (SerialPIO). GP6 = TX, GP7 = RX.
+// Wire crossed: sensor TX -> GP7 (Pico RX), sensor RX -> GP6 (Pico TX).
+#define MHZ_TX 6
+#define MHZ_RX 7
+SerialPIO mhzSerial(MHZ_TX, MHZ_RX);
 
 // ============================================================
 // DISPLAY (Arduino_GFX = LVGL flush backend)
@@ -60,24 +65,38 @@ Arduino_GC9A01 *gfx =
 Adafruit_NeoPixel ledRing(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 bool ledRingReady = false;
 
-// LVGL draw buffer (partial render, 40 lines high)
+// Full-screen LVGL draw buffer (RENDER_MODE_FULL): LVGL composes the whole
+// frame, then we push it in one go. This avoids the visible "section by
+// section" band refresh of partial rendering. Must be aligned (LVGL asserts).
 static lv_display_t *lvDisplay = nullptr;
-static uint8_t lvDrawBuf[SCREEN_W * 40 * (LV_COLOR_DEPTH / 8)];
+static uint8_t lvDrawBuf[SCREEN_W * SCREEN_H * (LV_COLOR_DEPTH / 8)]
+    __attribute__((aligned(64)));
 
 // ============================================================
 // ANIMATION CONFIGURATION
 // ============================================================
 
-#define NUM_RINGS 4
-#define RING_MIN_D 64    // min diameter (px)
-#define RING_MAX_D 232   // max diameter (px, kept inside the round bezel)
-#define RING_BORDER 6    // ring stroke width (px)
+// Single soft radial "glow" that breathes (heartbeat), instead of many
+// discrete ring strokes. Animated by growing/shrinking the gradient radius.
+#define GLOW_CX 120        // center (screen is 240x240)
+#define GLOW_CY 120
+#define GLOW_RMIN 34       // tight bright core radius (px)
+#define GLOW_RMAX 168      // fully expanded glow radius (px)
 
 // ============================================================
 // CONFIGURATION
 // ============================================================
 
 #define WIFI_CONFIG_FILE "/wifi.cfg"
+
+// --- Feature flags ---------------------------------------------------------
+// SKIP_WIFI=1 bypasses the whole WiFi/captive-portal flow and jumps straight
+// to the live CO2 display. Needed on a plain Pico 2 (no radio) and handy while
+// working on the display/animation. Set to 0 to re-enable provisioning.
+#define SKIP_WIFI 1
+// CO2_DEBUG=1 prints the raw 9-byte MH-Z19 UART frames so we can tell a wiring
+// problem (no bytes / wrong header) from a warm-up (out-of-range value) issue.
+#define CO2_DEBUG 1
 
 // Captive-portal network configuration (mirrors ModuleAir_V4)
 #define AP_IP_OCT_1 192
@@ -95,7 +114,7 @@ enum DeviceMode { MODE_STARTUP, MODE_CONFIG, MODE_NORMAL };
 // ============================================================
 
 uint16_t co2Value = 0;
-unsigned long lastCO2Read = 0;
+unsigned long lastCO2Request = 0;
 
 DeviceMode currentMode = MODE_STARTUP;
 
@@ -108,20 +127,30 @@ String chipId = "";
 String apSSID = "";
 WebServer server(WEB_PORT);
 DNSServer dnsServer;
+String cachedScanJson = "[]"; // networks scanned once before the AP comes up
 
-// Current pulse theme (driven by CO2 level)
-static uint16_t currentDurMs = 2000;
+// Current pulse theme (driven by CO2 level). The LED ring blends ledRGB ->
+// ledRGB2 around its circumference for a colour gradient matching the glow.
+static uint16_t currentDurMs = 4000;
 static uint8_t ledRGB[3] = {0, 200, 255};
+static uint8_t ledRGB2[3] = {0, 0, 200};
 static int currentLevel = -1; // -1 forces first theme apply
 
 const uint8_t CO2_CMD[] = {0xFF, 0x01, 0x86, 0x00, 0x00,
                            0x00, 0x00, 0x00, 0x79};
 
 // LVGL UI objects
-static lv_obj_t *rings[NUM_RINGS];
+static lv_obj_t *glow;          // full-screen object carrying the radial glow
+static lv_style_t glowStyle;
+static lv_grad_dsc_t glowGrad;  // referenced by glowStyle; modified in place
+static int32_t glowDummy = 0;   // animation driver variable
 static lv_obj_t *lblTitle;
 static lv_obj_t *lblValue;
 static lv_obj_t *lblSub;
+
+// Forward declarations
+void finishStartup();
+void onCO2Updated();
 
 // ============================================================
 // CO2 -> COLOR / SPEED MAPPING
@@ -152,10 +181,10 @@ int co2Level(uint16_t co2) {
 
 uint16_t getRingDuration(uint16_t co2) {
   switch (co2Level(co2)) {
-    case 0: return 2600; // calm
-    case 1: return 2000;
-    case 2: return 1500;
-    default: return 1000; // urgent
+    case 0: return 4000; // calm, slow breath
+    case 1: return 3200;
+    case 2: return 2400;
+    default: return 1600; // urgent, fast pulse
   }
 }
 
@@ -164,6 +193,11 @@ uint16_t getRingDuration(uint16_t co2) {
 // ============================================================
 
 static uint32_t lvMillisCb(void) { return millis(); }
+
+static void lvLogCb(lv_log_level_t level, const char *buf) {
+  (void)level;
+  Serial.print(buf);
+}
 
 static void lvFlushCb(lv_display_t *disp, const lv_area_t *area,
                       uint8_t *px_map) {
@@ -177,44 +211,51 @@ static void lvFlushCb(lv_display_t *disp, const lv_area_t *area,
 // LVGL ANIMATION CALLBACKS
 // ============================================================
 
-static void ringSizeCb(void *var, int32_t v) {
-  lv_obj_t *o = (lv_obj_t *)var;
-  lv_obj_set_size(o, v, v);
-  lv_obj_center(o);
+// Set the radius (in px) of the glow's outer/transparent edge by moving the
+// end circle of the radial gradient, then invalidate so it re-renders.
+static void setGlowRadius(int32_t r) {
+  glowGrad.params.radial.end.x = GLOW_CX;
+  glowGrad.params.radial.end.y = GLOW_CY;
+  glowGrad.params.radial.end_extent.x = GLOW_CX + r;
+  glowGrad.params.radial.end_extent.y = GLOW_CY;
+  lv_obj_invalidate(glow);
 }
 
-static void ringOpaCb(void *var, int32_t v) {
-  lv_obj_set_style_opa((lv_obj_t *)var, (lv_opa_t)v, 0);
-}
-
-// (Re)start the breathing animations with the given pulse duration.
-// Starting an animation with the same var+exec_cb replaces the previous
-// one, so this can be called freely whenever the speed changes.
-static void startRingAnims(uint16_t durMs) {
-  uint16_t step = durMs / NUM_RINGS;
-  for (int i = 0; i < NUM_RINGS; i++) {
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, rings[i]);
-    lv_anim_set_exec_cb(&a, ringSizeCb);
-    lv_anim_set_values(&a, RING_MIN_D, RING_MAX_D);
-    lv_anim_set_duration(&a, durMs);
-    lv_anim_set_delay(&a, step * i);
-    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-    lv_anim_start(&a);
-
-    lv_anim_t b;
-    lv_anim_init(&b);
-    lv_anim_set_var(&b, rings[i]);
-    lv_anim_set_exec_cb(&b, ringOpaCb);
-    lv_anim_set_values(&b, LV_OPA_COVER, LV_OPA_TRANSP);
-    lv_anim_set_duration(&b, durMs);
-    lv_anim_set_delay(&b, step * i);
-    lv_anim_set_repeat_count(&b, LV_ANIM_REPEAT_INFINITE);
-    lv_anim_set_path_cb(&b, lv_anim_path_linear);
-    lv_anim_start(&b);
+// Tint the glow with a two-colour radial gradient: bright "start" colour at the
+// core, shifting to the "end" colour as it fades out at the edge. Only the
+// colours change here; the opacity ramp (cover -> mid -> transparent) is set
+// once in buildUI() and is what gives the soft breathing halo.
+static void setGlowColors(const uint8_t *startRGB, const uint8_t *endRGB) {
+  if (glowGrad.stops_count >= 3) {
+    glowGrad.stops[0].color =
+        lv_color_make(startRGB[0], startRGB[1], startRGB[2]);
+    glowGrad.stops[1].color = lv_color_make(endRGB[0], endRGB[1], endRGB[2]);
+    glowGrad.stops[2].color = lv_color_make(endRGB[0], endRGB[1], endRGB[2]);
   }
+  lv_obj_invalidate(glow);
+}
+
+// Single driver: one looping animation advances a phase; the glow radius
+// breathes in/out (soft cosine) -> one smooth pulsing mass (heartbeat).
+static void glowAnimCb(void *var, int32_t v) {
+  (void)var;
+  float phase = (v / 1000.0f) * 2.0f * (float)M_PI;
+  float breath = 0.5f - 0.5f * cosf(phase); // 0 -> 1 -> 0, smooth
+  setGlowRadius(GLOW_RMIN + (int32_t)(breath * (GLOW_RMAX - GLOW_RMIN)));
+}
+
+// (Re)start the breathing with the given cycle duration. Starting an animation
+// with the same var+exec_cb replaces the previous one.
+static void startGlowAnim(uint16_t durMs) {
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, &glowDummy);
+  lv_anim_set_exec_cb(&a, glowAnimCb);
+  lv_anim_set_values(&a, 0, 1000);
+  lv_anim_set_duration(&a, durMs);
+  lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+  lv_anim_set_path_cb(&a, lv_anim_path_linear);
+  lv_anim_start(&a);
 }
 
 // ============================================================
@@ -226,21 +267,32 @@ void buildUI() {
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-  // Concentric breathing rings (transparent fill, colored AA border)
-  for (int i = 0; i < NUM_RINGS; i++) {
-    lv_obj_t *r = lv_obj_create(scr);
-    lv_obj_remove_style_all(r);
-    lv_obj_set_style_bg_opa(r, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(r, RING_BORDER, 0);
-    lv_obj_set_style_border_color(r, lv_color_hex(0x00C8FF), 0);
-    lv_obj_set_style_border_opa(r, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(r, LV_RADIUS_CIRCLE, 0);
-    lv_obj_remove_flag(
-        r, (lv_obj_flag_t)(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
-    lv_obj_set_size(r, RING_MIN_D, RING_MIN_D);
-    lv_obj_center(r);
-    rings[i] = r;
-  }
+  // One full-screen object filled with a radial gradient: bright tinted core
+  // fading to transparent at the edge. Animating the gradient radius makes it
+  // breathe as a single soft mass (no discrete ring strokes).
+  static const lv_color_t gcol[3] = {
+      LV_COLOR_MAKE(0, 200, 255), LV_COLOR_MAKE(0, 200, 255),
+      LV_COLOR_MAKE(0, 200, 255)};
+  static const lv_opa_t gopa[3] = {LV_OPA_COVER, 150, LV_OPA_TRANSP};
+  lv_grad_init_stops(&glowGrad, gcol, gopa, NULL, 3);
+  lv_grad_radial_init(&glowGrad, GLOW_CX, GLOW_CY, GLOW_CX + GLOW_RMIN, GLOW_CY,
+                      LV_GRAD_EXTEND_PAD);
+  lv_grad_radial_set_focal(&glowGrad, GLOW_CX, GLOW_CY, 0);
+
+  lv_style_init(&glowStyle);
+  lv_style_set_bg_grad(&glowStyle, &glowGrad);
+  lv_style_set_bg_opa(&glowStyle, LV_OPA_COVER);
+  lv_style_set_border_width(&glowStyle, 0);
+  lv_style_set_radius(&glowStyle, 0);
+  lv_style_set_pad_all(&glowStyle, 0);
+
+  glow = lv_obj_create(scr);
+  lv_obj_remove_style_all(glow);
+  lv_obj_add_style(glow, &glowStyle, 0);
+  lv_obj_set_size(glow, SCREEN_W, SCREEN_H);
+  lv_obj_center(glow);
+  lv_obj_remove_flag(
+      glow, (lv_obj_flag_t)(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
 
   // Labels (created after rings so they render on top)
   lblTitle = lv_label_create(scr);
@@ -261,48 +313,41 @@ void buildUI() {
   lv_label_set_text(lblSub, "");
   lv_obj_align(lblSub, LV_ALIGN_CENTER, 0, 50);
 
-  startRingAnims(currentDurMs);
+  startGlowAnim(currentDurMs);
 }
 
-// Apply a color gradient across the rings + set pulse speed + LED color.
+// Apply a CO2 theme: two-colour glow gradient + LED ring gradient + breathing
+// speed. start/end are the CO2 indicator colours (e.g. green->cyan for "good").
 void applyTheme(const uint8_t *startRGB, const uint8_t *endRGB,
                 uint16_t durMs) {
-  for (int i = 0; i < NUM_RINGS; i++) {
-    uint8_t mix = (NUM_RINGS > 1) ? (uint8_t)(255 - (255 * i) / (NUM_RINGS - 1))
-                                  : 255;
-    lv_color_t cs = lv_color_make(startRGB[0], startRGB[1], startRGB[2]);
-    lv_color_t ce = lv_color_make(endRGB[0], endRGB[1], endRGB[2]);
-    lv_color_t c = lv_color_mix(cs, ce, mix);
-    lv_obj_set_style_border_color(rings[i], c, 0);
+  setGlowColors(startRGB, endRGB);
+  for (uint8_t i = 0; i < 3; i++) {
+    ledRGB[i] = startRGB[i];
+    ledRGB2[i] = endRGB[i];
   }
-  ledRGB[0] = endRGB[0];
-  ledRGB[1] = endRGB[1];
-  ledRGB[2] = endRGB[2];
 
   if (durMs != currentDurMs) {
     currentDurMs = durMs;
-    startRingAnims(durMs);
+    startGlowAnim(durMs);
   }
 }
 
 void setStartupUI() {
   uint8_t s[3] = {0, 255, 255};
   uint8_t e[3] = {0, 0, 200};
-  applyTheme(s, e, 2000);
+  applyTheme(s, e, 4000);
 
   lv_label_set_text(lblTitle, "");
   lv_obj_set_style_text_font(lblValue, &lv_font_montserrat_48, 0);
-  lv_label_set_text(lblValue, "neuma");
-  lv_obj_align(lblValue, LV_ALIGN_CENTER, 0, -6);
-  lv_obj_set_style_text_font(lblSub, &lv_font_montserrat_28, 0);
-  lv_label_set_text(lblSub, "mini");
-  lv_obj_align(lblSub, LV_ALIGN_CENTER, 0, 34);
+  lv_label_set_text(lblValue, "alba");
+  lv_obj_align(lblValue, LV_ALIGN_CENTER, 0, 0);
+  lv_label_set_text(lblSub, "");
 }
 
 void setConfigUI() {
   uint8_t s[3] = {128, 0, 255};
   uint8_t e[3] = {255, 0, 128};
-  applyTheme(s, e, 2600);
+  applyTheme(s, e, 4500);
 
   lv_obj_set_style_text_font(lblTitle, &lv_font_montserrat_14, 0);
   lv_label_set_text(lblTitle, "Config WiFi");
@@ -363,9 +408,12 @@ void updateLeds() {
   for (uint16_t i = 0; i < LED_COUNT; i++) {
     float p = base + (float)i / LED_COUNT;
     float breath = 0.5f + 0.5f * sinf(p * 2.0f * (float)M_PI);
-    uint8_t r = (uint8_t)(ledRGB[0] * breath);
-    uint8_t g = (uint8_t)(ledRGB[1] * breath);
-    uint8_t b = (uint8_t)(ledRGB[2] * breath);
+    // Colour gradient around the ring: smoothly blend start -> end -> start so
+    // the two CO2 colours meet seamlessly (a full cosine sweep over the ring).
+    float t = 0.5f - 0.5f * cosf((float)i / LED_COUNT * 2.0f * (float)M_PI);
+    uint8_t r = (uint8_t)((ledRGB[0] + (ledRGB2[0] - ledRGB[0]) * t) * breath);
+    uint8_t g = (uint8_t)((ledRGB[1] + (ledRGB2[1] - ledRGB[1]) * t) * breath);
+    uint8_t b = (uint8_t)((ledRGB[2] + (ledRGB2[2] - ledRGB[2]) * t) * breath);
     ledRing.setPixelColor(i, ledRing.Color(r, g, b));
   }
   ledRing.show();
@@ -463,39 +511,69 @@ bool connectToWifi(const String &ssid, const String &password,
 // CO2 READING
 // ============================================================
 
-uint16_t readCO2() {
-  while (Serial1.available()) {
-    Serial1.read();
-  }
+// Non-blocking MH-Z19B reader. requestCO2() fires a measurement command;
+// pollCO2() (called every loop) collects the 9-byte reply across iterations
+// and updates co2Value + calls onCO2Updated() when a valid frame arrives.
+// This keeps the animation from stalling on the UART (the old blocking read
+// froze the screen ~200 ms every read).
+static bool co2Pending = false;
+static unsigned long co2RequestTime = 0;
 
-  Serial1.write(CO2_CMD, 9);
+void requestCO2() {
+  while (mhzSerial.available())
+    mhzSerial.read(); // flush stale bytes
+  mhzSerial.write(CO2_CMD, 9);
+  co2Pending = true;
+  co2RequestTime = millis();
+}
 
-  unsigned long startWait = millis();
-  while (Serial1.available() < 9 && millis() - startWait < 200) {
-    delay(10);
-  }
+void pollCO2() {
+  if (!co2Pending)
+    return;
 
-  if (Serial1.available() >= 9) {
-    uint8_t response[9];
-    Serial1.readBytes(response, 9);
+  if (mhzSerial.available() >= 9) {
+    uint8_t r[9];
+    mhzSerial.readBytes(r, 9); // returns immediately, bytes already buffered
+    co2Pending = false;
+
+#if CO2_DEBUG
+    Serial.printf("[CO2] RX: %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                  r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]);
+#endif
 
     // Validate header + checksum (MH-Z19B: byte8 = 0xFF - sum(byte1..7) + 1)
-    if (response[0] == 0xFF && response[1] == 0x86) {
-      uint8_t checksum = 0;
+    if (r[0] == 0xFF && r[1] == 0x86) {
+      uint8_t cs = 0;
       for (int i = 1; i < 8; i++)
-        checksum += response[i];
-      checksum = (uint8_t)(0xFF - checksum + 1);
-
-      if (checksum == response[8]) {
-        uint16_t co2 = (response[2] << 8) | response[3];
-        if (co2 > 300 && co2 < 5000) {
-          return co2;
+        cs += r[i];
+      cs = (uint8_t)(0xFF - cs + 1);
+      if (cs == r[8]) {
+        uint16_t c = (r[2] << 8) | r[3];
+        if (c > 300 && c < 5000) {
+          co2Value = c;
+          onCO2Updated();
         }
+#if CO2_DEBUG
+        else
+          Serial.printf("[CO2] value %u out of range (warming up?)\n", c);
+#endif
       }
+#if CO2_DEBUG
+      else
+        Serial.println("[CO2] checksum mismatch");
+#endif
     }
+#if CO2_DEBUG
+    else
+      Serial.println("[CO2] bad header -> check TX/RX wiring (crossed?) & 9600 baud");
+#endif
+  } else if (millis() - co2RequestTime > 300) {
+#if CO2_DEBUG
+    Serial.printf("[CO2] no reply (%d bytes) -> check wiring/power/5V\n",
+                  mhzSerial.available());
+#endif
+    co2Pending = false; // no/short reply, drop and retry next cycle
   }
-
-  return co2Value > 0 ? co2Value : 0;
 }
 
 // ============================================================
@@ -505,7 +583,7 @@ uint16_t readCO2() {
 static const char CONFIG_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
 <html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>neuma mini - Config WiFi</title>
+<title>alba - Config WiFi</title>
 <style>
 *{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;
 background:#1a1a2e;color:#e0e0e0;display:flex;justify-content:center;padding:18px}
@@ -527,7 +605,7 @@ background:#4fc3f7;color:#06121c;font-weight:600;font-size:1em;cursor:pointer}
 .muted{color:#778;font-size:.8em;text-align:center;margin-top:14px}
 </style></head><body>
 <div class="card">
-<h1>neuma mini</h1>
+<h1>alba</h1>
 <p class="sub">Configuration du WiFi</p>
 <div id="nets" class="nets">Recherche des reseaux...</div>
 <form action="/save" method="POST">
@@ -555,8 +633,8 @@ function tog(){var p=document.getElementById('pw');p.type=p.type=='password'?'te
 scan();
 </script></body></html>)HTML";
 
-void handleScan() {
-  Serial.println("[Web] /scan");
+// Scan networks (must be in STA mode) and return them as a JSON array.
+String scanToJson() {
   int n = WiFi.scanNetworks();
   if (n < 0)
     n = 0;
@@ -579,7 +657,13 @@ void handleScan() {
   json += "]";
 
   WiFi.scanDelete();
-  server.send(200, "application/json", json);
+  return json;
+}
+
+// The page fetches /scan: serve the list captured before the AP started
+// (a live scan is unreliable while the cyw43 is in AP mode).
+void handleScan() {
+  server.send(200, "application/json", cachedScanJson);
 }
 
 void handleSave() {
@@ -599,10 +683,10 @@ void handleSave() {
   String page =
       "<!DOCTYPE html><html lang=\"fr\"><head><meta charset=\"utf-8\">"
       "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-      "<title>neuma mini</title>"
+      "<title>alba</title>"
       "<style>body{font-family:system-ui,sans-serif;background:#1a1a2e;"
       "color:#e0e0e0;text-align:center;padding:40px}h1{color:#4fc3f7}</style>"
-      "</head><body><h1>neuma mini</h1>"
+      "</head><body><h1>alba</h1>"
       "<p>Connexion a <b>" + ssid + "</b>...</p>"
       "<p>L'appareil redemarre. Vous pouvez fermer cette page.</p>"
       "</body></html>";
@@ -634,7 +718,7 @@ void handleStatus() {
       "<!DOCTYPE html><html lang=\"fr\"><head><meta charset=\"utf-8\">"
       "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
       "<meta http-equiv=\"refresh\" content=\"5\">"
-      "<title>neuma mini</title>"
+      "<title>alba</title>"
       "<style>body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#e0e0e0;"
       "text-align:center;padding:24px}h1{color:#4fc3f7;margin:.2em}"
       ".co2{font-size:3.2em;font-weight:700;margin:.1em}.lvl{color:#7a8;font-size:1.1em}"
@@ -642,7 +726,7 @@ void handleStatus() {
       "td:first-child{color:#9aa}form{margin-top:20px}"
       "button{padding:11px 18px;border:none;border-radius:8px;background:#b33;color:#fff;"
       "font-size:1em;cursor:pointer}</style></head><body>"
-      "<h1>neuma mini</h1>"
+      "<h1>alba</h1>"
       "<div class=\"co2\">" + String(co2Value) + " <span style='font-size:.4em'>ppm</span></div>"
       "<div class=\"lvl\">" + level + "</div>"
       "<table>"
@@ -700,14 +784,23 @@ void startConfigMode() {
   Serial.println("Entering configuration mode (WiFi AP)...");
   currentMode = MODE_CONFIG;
 
-  WiFi.mode(WIFI_AP_STA); // AP + STA so we can also scan networks
+  // 1) Scan available networks in STA mode first, cache the list for the page.
+  Serial.println("[WiFi] Scanning networks before AP...");
+  WiFi.mode(WIFI_STA);
+  cachedScanJson = scanToJson();
+  Serial.printf("[WiFi] Scan done (%d bytes)\n", cachedScanJson.length());
+
+  // 2) Bring up an open Access-Point only (reliable on the cyw43; AP+STA is
+  //    flaky and can leave the SSID invisible).
   IPAddress apIP(AP_IP_OCT_1, AP_IP_OCT_2, AP_IP_OCT_3, AP_IP_OCT_4);
   IPAddress subnet(255, 255, 255, 0);
+  WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(apIP, apIP, subnet);
-  WiFi.softAP(apSSID.c_str()); // open network
+  bool apOk = WiFi.softAP(apSSID.c_str()); // open network (no password)
 
-  Serial.printf("[AP] SSID: %s\n", apSSID.c_str());
-  Serial.printf("[AP] IP:   %s\n", WiFi.softAPIP().toString().c_str());
+  Serial.printf("[AP] softAP(%s) -> %s\n", apSSID.c_str(),
+                apOk ? "OK" : "FAILED");
+  Serial.printf("[AP] IP: %s\n", WiFi.softAPIP().toString().c_str());
 
   dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
   registerRoutes();
@@ -721,13 +814,15 @@ void startNormalMode() {
   Serial.println("Entering normal mode...");
   currentMode = MODE_NORMAL;
 
+#if !SKIP_WIFI
   registerRoutes();
   server.begin();
   Serial.printf("[Web] Status page at http://%s/\n",
                 WiFi.localIP().toString().c_str());
+#endif
 
   setNormalUI();
-  lastCO2Read = millis();
+  lastCO2Request = millis();
 }
 
 // ============================================================
@@ -735,10 +830,9 @@ void startNormalMode() {
 // ============================================================
 
 static unsigned long startupStart = 0;
-static unsigned long startupLastRead = 0;
-static unsigned long firstValidRead = 0;
+static bool startupSensorSeen = false;
+static unsigned long startupFirstSeen = 0;
 static uint16_t startupPrevCO2 = 0;
-static bool sensorResponding = false;
 
 void finishStartup() {
   if (co2Value == 0) {
@@ -747,6 +841,11 @@ void finishStartup() {
   }
   Serial.println("Boot animation complete!");
 
+#if SKIP_WIFI
+  Serial.println("WiFi disabled (SKIP_WIFI) -> live CO2 display");
+  startNormalMode();
+  return;
+#else
   if (loadWifiCredentials()) {
     Serial.println("Stored credentials found, connecting...");
     if (connectToWifi(storedSSID, storedPassword, 10000)) {
@@ -758,37 +857,39 @@ void finishStartup() {
     Serial.println("No stored WiFi credentials, entering config mode");
   }
   startConfigMode();
+#endif
 }
 
-void handleStartup() {
-  unsigned long elapsed = millis() - startupStart;
-
-  if (millis() - startupLastRead > 1000) {
-    startupLastRead = millis();
-    startupPrevCO2 = co2Value;
-    uint16_t c = readCO2();
-    if (c > 0) {
-      co2Value = c;
-      if (!sensorResponding) {
-        sensorResponding = true;
-        firstValidRead = millis();
-        Serial.printf("First valid reading: %d ppm\n", c);
-      }
-      // Sensor is "ready" once the reading changes, or after a stable window
-      if (startupPrevCO2 > 0 && startupPrevCO2 != c) {
-        Serial.printf("Sensor ready: %d -> %d ppm\n", startupPrevCO2, c);
-        finishStartup();
-        return;
-      }
-      if (millis() - firstValidRead > 15000) {
-        Serial.println("15s stable reading, proceeding...");
-        finishStartup();
-        return;
-      }
+// Called by pollCO2() whenever a fresh, valid reading lands.
+void onCO2Updated() {
+  if (currentMode == MODE_STARTUP) {
+    if (!startupSensorSeen) {
+      startupSensorSeen = true;
+      startupFirstSeen = millis();
+      startupPrevCO2 = co2Value;
+      Serial.printf("First valid reading: %d ppm\n", co2Value);
+      return;
     }
+    if (co2Value != startupPrevCO2) {
+      Serial.printf("Sensor ready: %d -> %d ppm\n", startupPrevCO2, co2Value);
+      finishStartup();
+      return;
+    }
+    if (millis() - startupFirstSeen > 15000) {
+      Serial.println("15s stable reading, proceeding...");
+      finishStartup();
+      return;
+    }
+    startupPrevCO2 = co2Value;
+  } else if (currentMode == MODE_NORMAL) {
+    Serial.printf("CO2: %d ppm\n", co2Value);
+    refreshNormal();
   }
+}
 
-  if (elapsed > 30000) {
+// Only responsibility left here: the overall startup timeout.
+void handleStartup() {
+  if (millis() - startupStart > 30000) {
     Serial.println("Startup timeout, proceeding...");
     finishStartup();
   }
@@ -814,11 +915,15 @@ void checkSerialReset() {
 
 void setup() {
   Serial.begin(115200);
+  // Give the USB-CDC link time to enumerate so the early boot logs aren't lost.
+  // The PlatformIO monitor does not reset the Pico, so without this wait the
+  // first prints often disappear. Bounded so the board still boots headless.
+  unsigned long serialT0 = millis();
+  while (!Serial && millis() - serialT0 < 3000)
+    delay(10);
   delay(100);
 
-  Serial1.setTX(MHZ_TX);
-  Serial1.setRX(MHZ_RX);
-  Serial1.begin(9600);
+  mhzSerial.begin(9600); // PIO-emulated UART on GP6/GP7 (pins set in ctor)
 
   ledRing.begin();
   ledRing.setBrightness(LED_BRIGHTNESS);
@@ -829,7 +934,7 @@ void setup() {
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
 
-  if (!gfx->begin()) {
+  if (!gfx->begin(62500000)) { // higher SPI clock -> faster flush, smoother
     Serial.println("gfx->begin() failed!");
     while (1)
       ;
@@ -843,27 +948,31 @@ void setup() {
     LittleFS.begin();
   }
 
-  // Derive device id / AP SSID from MAC
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
-  chipId = String(mac[3], HEX) + String(mac[4], HEX) + String(mac[5], HEX);
+  // Derive device id / AP SSID from the board's unique chip id (a hex string,
+  // valid this early in setup unlike WiFi.macAddress() which needs the radio).
+  String fullId = String(rp2040.getChipID());
+  chipId = fullId.substring(fullId.length() >= 6 ? fullId.length() - 6 : 0);
   chipId.toUpperCase();
-  apSSID = "neuma-" + chipId;
+  apSSID = "alba-" + chipId;
   Serial.printf("Device: %s\n", apSSID.c_str());
 
   // --- LVGL ---
   lv_init();
+  lv_log_register_print_cb(lvLogCb);
   lv_tick_set_cb(lvMillisCb);
   lvDisplay = lv_display_create(SCREEN_W, SCREEN_H);
   lv_display_set_flush_cb(lvDisplay, lvFlushCb);
   lv_display_set_buffers(lvDisplay, lvDrawBuf, NULL, sizeof(lvDrawBuf),
-                         LV_DISPLAY_RENDER_MODE_PARTIAL);
+                         LV_DISPLAY_RENDER_MODE_FULL);
 
   buildUI();
   setStartupUI();
 
   currentMode = MODE_STARTUP;
   startupStart = millis();
+  requestCO2(); // kick off the first (non-blocking) sensor reading
+  lastCO2Request = millis();
+  Serial.println("Setup complete, entering loop");
 }
 
 // ============================================================
@@ -873,6 +982,14 @@ void setup() {
 void loop() {
   lv_timer_handler();
   updateLeds();
+  pollCO2();
+
+  // Fire a new (non-blocking) sensor request periodically.
+  unsigned long reqInterval = (currentMode == MODE_STARTUP) ? 1500 : 3000;
+  if (!co2Pending && millis() - lastCO2Request > reqInterval) {
+    requestCO2();
+    lastCO2Request = millis();
+  }
 
   switch (currentMode) {
   case MODE_STARTUP:
@@ -880,20 +997,18 @@ void loop() {
     break;
 
   case MODE_CONFIG:
+#if !SKIP_WIFI
     dnsServer.processNextRequest();
     server.handleClient();
     checkSerialReset();
+#endif
     break;
 
   case MODE_NORMAL:
+#if !SKIP_WIFI
     server.handleClient();
     checkSerialReset();
-    if (millis() - lastCO2Read > 3000) {
-      co2Value = readCO2();
-      lastCO2Read = millis();
-      Serial.printf("CO2: %d ppm\n", co2Value);
-      refreshNormal();
-    }
+#endif
     break;
   }
 
