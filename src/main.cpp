@@ -18,7 +18,7 @@
 #include <Arduino.h>
 #include <lvgl.h>
 #include <Arduino_GFX_Library.h>
-#include <Adafruit_NeoPixel.h>
+#include <WS2812FX.h> // pulls in Adafruit_NeoPixel as its driver
 #include <SerialPIO.h>
 #include <math.h>
 
@@ -62,7 +62,11 @@ Arduino_DataBus *bus = new Arduino_RPiPicoSPI(TFT_DC, TFT_CS, TFT_SCK, TFT_MOSI,
 Arduino_GC9A01 *gfx =
     new Arduino_GC9A01(bus, TFT_RST, 0 /* rotation */, true /* IPS */);
 
-Adafruit_NeoPixel ledRing(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+// LED ring driven by WS2812FX (built-in BREATH effect = the soft "standby"
+// heartbeat). Its driver is Adafruit_NeoPixel, the same path that already
+// works on this board. Colour is set from the CO2 level; the breath cadence is
+// fixed (slow & gentle) so the screen carries the urgency via its pulse speed.
+WS2812FX ws2812fx(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 bool ledRingReady = false;
 
 // Full-screen LVGL draw buffer (RENDER_MODE_FULL): LVGL composes the whole
@@ -129,11 +133,9 @@ WebServer server(WEB_PORT);
 DNSServer dnsServer;
 String cachedScanJson = "[]"; // networks scanned once before the AP comes up
 
-// Current pulse theme (driven by CO2 level). The LED ring blends ledRGB ->
-// ledRGB2 around its circumference for a colour gradient matching the glow.
-static uint16_t currentDurMs = 4000;
-static uint8_t ledRGB[3] = {0, 200, 255};
-static uint8_t ledRGB2[3] = {0, 0, 200};
+// Current pulse theme (driven by CO2 level). currentDurMs is the breathing
+// period, used by breathLevel() which both the glow and the LED ring sample.
+static uint16_t currentDurMs = 6000;
 static int currentLevel = -1; // -1 forces first theme apply
 
 const uint8_t CO2_CMD[] = {0xFF, 0x01, 0x86, 0x00, 0x00,
@@ -143,7 +145,6 @@ const uint8_t CO2_CMD[] = {0xFF, 0x01, 0x86, 0x00, 0x00,
 static lv_obj_t *glow;          // full-screen object carrying the radial glow
 static lv_style_t glowStyle;
 static lv_grad_dsc_t glowGrad;  // referenced by glowStyle; modified in place
-static int32_t glowDummy = 0;   // animation driver variable
 static lv_obj_t *lblTitle;
 static lv_obj_t *lblValue;
 static lv_obj_t *lblSub;
@@ -181,10 +182,10 @@ int co2Level(uint16_t co2) {
 
 uint16_t getRingDuration(uint16_t co2) {
   switch (co2Level(co2)) {
-    case 0: return 4000; // calm, slow breath
-    case 1: return 3200;
-    case 2: return 2400;
-    default: return 1600; // urgent, fast pulse
+    case 0: return 7000; // calm, very slow breath
+    case 1: return 6000;
+    case 2: return 5000;
+    default: return 4000; // worst air: a bit quicker, still gentle
   }
 }
 
@@ -235,27 +236,19 @@ static void setGlowColors(const uint8_t *startRGB, const uint8_t *endRGB) {
   lv_obj_invalidate(glow);
 }
 
-// Single driver: one looping animation advances a phase; the glow radius
-// breathes in/out (soft cosine) -> one smooth pulsing mass (heartbeat).
-static void glowAnimCb(void *var, int32_t v) {
-  (void)var;
-  float phase = (v / 1000.0f) * 2.0f * (float)M_PI;
-  float breath = 0.5f - 0.5f * cosf(phase); // 0 -> 1 -> 0, smooth
-  setGlowRadius(GLOW_RMIN + (int32_t)(breath * (GLOW_RMAX - GLOW_RMIN)));
+// THE breathing oscillator: a single stateless function of time, sampled by
+// BOTH the screen glow and the LED ring, so they pulse in sync by construction
+// (no shared mutable state, no cross-engine bridge). 0 -> 1 -> 0 (soft cosine)
+// over currentDurMs. Changing currentDurMs just changes the breathing rate.
+float breathLevel() {
+  float t = (float)(millis() % currentDurMs) / (float)currentDurMs;
+  return 0.5f - 0.5f * cosf(t * 2.0f * (float)M_PI);
 }
 
-// (Re)start the breathing with the given cycle duration. Starting an animation
-// with the same var+exec_cb replaces the previous one.
-static void startGlowAnim(uint16_t durMs) {
-  lv_anim_t a;
-  lv_anim_init(&a);
-  lv_anim_set_var(&a, &glowDummy);
-  lv_anim_set_exec_cb(&a, glowAnimCb);
-  lv_anim_set_values(&a, 0, 1000);
-  lv_anim_set_duration(&a, durMs);
-  lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
-  lv_anim_set_path_cb(&a, lv_anim_path_linear);
-  lv_anim_start(&a);
+// LVGL timer (native scheduler): sample the oscillator and resize the glow.
+static void glowBreathCb(lv_timer_t *timer) {
+  (void)timer;
+  setGlowRadius(GLOW_RMIN + (int32_t)(breathLevel() * (GLOW_RMAX - GLOW_RMIN)));
 }
 
 // ============================================================
@@ -313,23 +306,18 @@ void buildUI() {
   lv_label_set_text(lblSub, "");
   lv_obj_align(lblSub, LV_ALIGN_CENTER, 0, 50);
 
-  startGlowAnim(currentDurMs);
+  // Drive the glow breathing from the shared oscillator via LVGL's scheduler.
+  lv_timer_create(glowBreathCb, 16, NULL); // ~60 fps
 }
 
-// Apply a CO2 theme: two-colour glow gradient + LED ring gradient + breathing
-// speed. start/end are the CO2 indicator colours (e.g. green->cyan for "good").
+// Apply a CO2 theme: two-colour glow gradient on screen + LED breath colour +
+// breathing rate. start/end are the CO2 indicator colours.
 void applyTheme(const uint8_t *startRGB, const uint8_t *endRGB,
                 uint16_t durMs) {
   setGlowColors(startRGB, endRGB);
-  for (uint8_t i = 0; i < 3; i++) {
-    ledRGB[i] = startRGB[i];
-    ledRGB2[i] = endRGB[i];
-  }
-
-  if (durMs != currentDurMs) {
-    currentDurMs = durMs;
-    startGlowAnim(durMs);
-  }
+  // LED ring breathes from off to the dominant CO2 colour.
+  ws2812fx.setColor(ws2812fx.Color(startRGB[0], startRGB[1], startRGB[2]));
+  currentDurMs = durMs; // breathLevel() picks up the new rate immediately
 }
 
 void setStartupUI() {
@@ -392,31 +380,30 @@ void refreshNormal() {
 }
 
 // ============================================================
-// LED RING (breathing wave synchronized with the pulse speed)
+// LED RING (custom WS2812FX mode: breath locked to the screen glow)
 // ============================================================
 
+// Custom WS2812FX effect: fill the whole ring with the segment colour scaled by
+// breathLevel() -- the exact same oscillator the screen glow samples -- so the
+// ring and the glow pulse in perfect lock-step. A small floor keeps the ring
+// softly lit at the trough (gentle "leger" look) instead of fully off.
+uint16_t breathSyncMode(void) {
+  WS2812FX::Segment *seg = ws2812fx.getSegment();
+  float level = 0.12f + 0.88f * breathLevel(); // 0.12 .. 1.0
+  uint32_t c = seg->colors[0];
+  uint8_t r = (uint8_t)(((c >> 16) & 0xFF) * level);
+  uint8_t g = (uint8_t)(((c >> 8) & 0xFF) * level);
+  uint8_t b = (uint8_t)((c & 0xFF) * level);
+  uint32_t scaled = ws2812fx.Color(r, g, b);
+  for (uint16_t i = seg->start; i <= seg->stop; i++)
+    ws2812fx.setPixelColor(i, scaled);
+  return 16; // re-render ~60 fps; brightness tracks the glow continuously
+}
+
+// Drive the WS2812FX engine (which runs breathSyncMode above).
 void updateLeds() {
-  if (!ledRingReady)
-    return;
-
-  static unsigned long lastShow = 0;
-  if (millis() - lastShow < 33) // ~30 fps
-    return;
-  lastShow = millis();
-
-  float base = (float)(millis() % currentDurMs) / (float)currentDurMs;
-  for (uint16_t i = 0; i < LED_COUNT; i++) {
-    float p = base + (float)i / LED_COUNT;
-    float breath = 0.5f + 0.5f * sinf(p * 2.0f * (float)M_PI);
-    // Colour gradient around the ring: smoothly blend start -> end -> start so
-    // the two CO2 colours meet seamlessly (a full cosine sweep over the ring).
-    float t = 0.5f - 0.5f * cosf((float)i / LED_COUNT * 2.0f * (float)M_PI);
-    uint8_t r = (uint8_t)((ledRGB[0] + (ledRGB2[0] - ledRGB[0]) * t) * breath);
-    uint8_t g = (uint8_t)((ledRGB[1] + (ledRGB2[1] - ledRGB[1]) * t) * breath);
-    uint8_t b = (uint8_t)((ledRGB[2] + (ledRGB2[2] - ledRGB[2]) * t) * breath);
-    ledRing.setPixelColor(i, ledRing.Color(r, g, b));
-  }
-  ledRing.show();
+  if (ledRingReady)
+    ws2812fx.service();
 }
 
 // ============================================================
@@ -925,10 +912,14 @@ void setup() {
 
   mhzSerial.begin(9600); // PIO-emulated UART on GP6/GP7 (pins set in ctor)
 
-  ledRing.begin();
-  ledRing.setBrightness(LED_BRIGHTNESS);
-  ledRing.clear();
-  ledRing.show();
+  ws2812fx.init();
+  ws2812fx.setBrightness(LED_BRIGHTNESS);
+  // Register our screen-synced breath as custom mode 0 and run it on the whole
+  // ring. Colour is updated per CO2 level via ws2812fx.setColor() in applyTheme.
+  ws2812fx.setCustomMode(breathSyncMode);
+  ws2812fx.setSegment(0, 0, LED_COUNT - 1, FX_MODE_CUSTOM_0,
+                      ws2812fx.Color(0, 200, 255), 1000, false);
+  ws2812fx.start();
   ledRingReady = true;
 
   pinMode(TFT_BL, OUTPUT);
