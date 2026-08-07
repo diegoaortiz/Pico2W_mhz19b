@@ -4,9 +4,11 @@
  *
  * Rendering: LVGL v9 (declarative, anti-aliased, animation-engine driven)
  *   - Arduino_GFX is used only as the low-level flush driver for the GC9A01.
- *   - Breathing "pulse" rings are LVGL objects animated by lv_anim
- *     (size + opacity, ease-out, phase-offset for a wave effect).
- *   - Ring color + pulse speed are driven by the CO2 level.
+ *   - A "target" of concentric filled circles (Andre Lemonnier style) breathes:
+ *     the whole stack scales in/out from a shared cosine oscillator, with a
+ *     gentle per-ring phase wave so the rings ripple.
+ *   - The ring colours form a gradient (bright core -> rim) sampled from the
+ *     CO2 level; the breathing rate is also driven by the CO2 level.
  *
  * WiFi provisioning: open Access-Point + captive portal (inspired by
  *   ModuleAir_V4), credentials stored in flash (LittleFS).
@@ -27,6 +29,8 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+#include <HTTPClient.h>       // POST measurements to the AirCarto endpoint
+#include <WiFiClientSecure.h> // TLS for the https:// data server
 
 // ============================================================
 // PIN CONFIGURATION - Pico 2W
@@ -80,12 +84,25 @@ static uint8_t lvDrawBuf[SCREEN_W * SCREEN_H * (LV_COLOR_DEPTH / 8)]
 // ANIMATION CONFIGURATION
 // ============================================================
 
-// Single soft radial "glow" that breathes (heartbeat), instead of many
-// discrete ring strokes. Animated by growing/shrinking the gradient radius.
-#define GLOW_CX 120        // center (screen is 240x240)
-#define GLOW_CY 120
-#define GLOW_RMIN 34       // tight bright core radius (px)
-#define GLOW_RMAX 168      // fully expanded glow radius (px)
+// Concentric "target" of breathing rings (inspired by Andre Lemonnier's
+// circles), drawn as ONE full-screen radial gradient whose colour stops form
+// distinct bands: bright core colour -> rim colour, then a soft fade to black.
+//
+// Why a gradient and not stacked circle objects? Breathing has to be smooth.
+// Moving hard-edged geometry in whole pixels looks stepped ("par paliers")
+// because the motion is slow (the radius only changes ~1px every 100ms), and
+// transform_scale (the sub-pixel alternative) needs a 250KB ARGB layer that
+// does not fit in RAM. A radial gradient sidesteps both: animating its radius
+// re-rasterises softly every frame, so the breath is fluid -- exactly the
+// mechanism the original single-colour glow used. The banding (sharp colour
+// holds + thin ramps) is what turns that smooth glow into visible rings.
+#define RING_CX 120          // centre (screen is 240x240)
+#define RING_CY 120
+#define RING_COUNT 8         // number of colour bands
+#define RING_RAMP 4          // soft transition width between bands (1/255 units)
+#define RING_GRAD_RMAX 150   // gradient radius (px) at full breath (frac 255)
+#define RING_SCALE_MIN 0.60f // trough scale (whole target shrinks to 60%)
+#define RING_FRAME_MS 16     // ~60 fps (single gradient fill is cheap)
 
 // ============================================================
 // CONFIGURATION
@@ -97,10 +114,14 @@ static uint8_t lvDrawBuf[SCREEN_W * SCREEN_H * (LV_COLOR_DEPTH / 8)]
 // SKIP_WIFI=1 bypasses the whole WiFi/captive-portal flow and jumps straight
 // to the live CO2 display. Needed on a plain Pico 2 (no radio) and handy while
 // working on the display/animation. Set to 0 to re-enable provisioning.
-#define SKIP_WIFI 1
+// Re-enabled: full ModuleAir_V4 connection state machine (connect -> scan ->
+// retry -> AP fallback -> periodic background reconnect).
+#define SKIP_WIFI 0
 // CO2_DEBUG=1 prints the raw 9-byte MH-Z19 UART frames so we can tell a wiring
 // problem (no bytes / wrong header) from a warm-up (out-of-range value) issue.
 #define CO2_DEBUG 1
+// How long the "alba" splash screen stays before switching to the live display.
+#define SPLASH_MS 4500
 
 // Captive-portal network configuration (mirrors ModuleAir_V4)
 #define AP_IP_OCT_1 192
@@ -110,17 +131,60 @@ static uint8_t lvDrawBuf[SCREEN_W * SCREEN_H * (LV_COLOR_DEPTH / 8)]
 #define DNS_PORT 53
 #define WEB_PORT 80
 
-// Device modes
+// --- Data upload (AirCarto Alba ingestion endpoint) ------------------------
+// JSON POST body, format defined by api.aircarto.fr/capteurs/alba.php.
+#define DATA_SERVER_URL "https://api.aircarto.fr/capteurs/alba.php"
+#define DATA_SEND_INTERVAL 60000UL // push a measurement every 60 s (ModuleAir)
+#define DATA_WARMUP_MS 15000UL     // first push ~15 s after (re)connect
+#define FIRMWARE_VERSION "1.0.0"   // reported as version_major.minor.patch
+#define PROTOCOL_VERSION 1         // "version" field expected by the endpoint
+
+// --- WiFi connection state-machine timings (mirrors ModuleAir_V4) ----------
+#define WIFI_CONNECT_TIMEOUT_MS 15000UL       // one STA connection attempt
+#define WIFI_MAX_ATTEMPTS 2                   // boot tries before AP fallback
+#define AP_CONFIG_DURATION_MS (3UL * 60 * 1000)  // "Config WiFi" splash, then ppm
+#define AP_RETRY_INTERVAL_MS (10UL * 60 * 1000)  // background reconnect cadence
+#define AP_RETRY_TIMEOUT_MS (30UL * 1000)        // one background reconnect try
+#define STA_RECONNECT_WINDOW_MS (3UL * 60 * 1000) // recover a dropped STA link
+#define STA_RECONNECT_KICK_MS (30UL * 1000)       // re-kick driver while recovering
+
+// Device modes (drive the DISPLAY: splash / config screen / ppm)
 enum DeviceMode { MODE_STARTUP, MODE_CONFIG, MODE_NORMAL };
+
+// WiFi connection FSM (drives the RADIO; independent of the display mode above).
+// Mirrors ModuleAir_V4's wifi_manager state machine. Concurrent AP+STA is used
+// for the background reconnect (WIFI_AP_STA) so the config hotspot stays up the
+// whole time -- reliable since arduino-pico 5.5.1 (PR #3374), which we pin.
+enum WifiState {
+  WS_STA_CONNECTED,    // connected to a known network, normal operation
+  WS_STA_RECONNECTING, // link dropped: trying to recover for up to 3 min
+  WS_AP_CONFIG,        // AP up, screen shows "Config WiFi" (first 3 min)
+  WS_AP_DATA,          // AP still up but screen shows ppm; retries every 10 min
+  WS_AP_RETRYING,      // AP+STA: attempting a background reconnect (AP stays up)
+};
 
 // ============================================================
 // GLOBALS
 // ============================================================
 
-uint16_t co2Value = 0;
+uint16_t co2Value = 0; // last instantaneous reading (drives the live display)
+
+// Averaging accumulators for the value we UPLOAD. Like ModuleAir-Next-Gen, we
+// average every valid CO2 reading taken during the send window and transmit the
+// mean (not the last instantaneous value), then reset the window on each send.
+uint32_t co2Sum = 0;
+uint16_t co2SampleCount = 0;
+
 unsigned long lastCO2Request = 0;
 
 DeviceMode currentMode = MODE_STARTUP;
+
+// WiFi connection state machine
+WifiState wifiState = WS_AP_CONFIG;       // set for real once we leave startup
+unsigned long stateEnteredAt = 0;         // millis() when wifiState last changed
+unsigned long lastReconnectKickAt = 0;    // last WiFi.reconnect() during recovery
+bool serverStarted = false;               // HTTP server begun at least once
+bool routesRegistered = false;            // HTTP routes registered (once only)
 
 // WiFi credentials
 String storedSSID = "";
@@ -133,6 +197,18 @@ WebServer server(WEB_PORT);
 DNSServer dnsServer;
 String cachedScanJson = "[]"; // networks scanned once before the AP comes up
 
+// Device identity (derived from the WiFi MAC in setup()).
+//   deviceToken : printable serial, MAC-derived, also shown in the SSID
+//                 ("alba-<token>"); this is what gets registered server-side.
+//   deviceIdHex : hex encoding of deviceToken's ASCII bytes -- the "device_id"
+//                 field the endpoint expects (it does pack('H*') to recover the
+//                 token). e.g. token "A1B2C3" -> device_id "413142324333".
+String deviceToken = "";
+String deviceIdHex = "";
+String deviceMac = "n/a";       // colon-formatted MAC, for the identity banner
+bool tokenFromChipId = false;   // true if the MAC was unavailable (fallback)
+unsigned long lastDataSend = 0; // millis() of the last upload attempt
+
 // Current pulse theme (driven by CO2 level). currentDurMs is the breathing
 // period, used by breathLevel() which both the glow and the LED ring sample.
 static uint16_t currentDurMs = 6000;
@@ -142,16 +218,29 @@ const uint8_t CO2_CMD[] = {0xFF, 0x01, 0x86, 0x00, 0x00,
                            0x00, 0x00, 0x00, 0x79};
 
 // LVGL UI objects
-static lv_obj_t *glow;          // full-screen object carrying the radial glow
+static lv_obj_t *glow;          // full-screen object carrying the banded gradient
 static lv_style_t glowStyle;
 static lv_grad_dsc_t glowGrad;  // referenced by glowStyle; modified in place
 static lv_obj_t *lblTitle;
 static lv_obj_t *lblValue;
 static lv_obj_t *lblSub;
+static lv_obj_t *lblIcon; // big WiFi / OK / X glyph for the connection screens
 
 // Forward declarations
 void finishStartup();
 void onCO2Updated();
+void setWifiState(WifiState s);
+void startWebServer();
+void apStart();
+void showNormalDisplay();
+void enterStaConnected();
+void startConfigMode();
+void attemptBackgroundReconnect();
+bool wifiSsidIsVisible(const String &ssid);
+bool isApActive();
+void wifiManagerLoop();
+void dataSenderSend();
+void printIdentity();
 
 // ============================================================
 // CO2 -> COLOR / SPEED MAPPING
@@ -159,8 +248,11 @@ void onCO2Updated();
 
 void getCO2Colors(uint16_t co2, uint8_t *startRGB, uint8_t *endRGB) {
   if (co2 < 600) {
-    startRGB[0] = 100; startRGB[1] = 255; startRGB[2] = 100;
-    endRGB[0] = 0;     endRGB[1] = 255;   endRGB[2] = 255;
+    // Vivid green core -> deep teal rim. The old green->cyan pair both had
+    // G=255, so the 9 rings barely differed and melted into one mass; this
+    // wider swing keeps the rings distinct (like the other levels do).
+    startRGB[0] = 120; startRGB[1] = 255; startRGB[2] = 80;
+    endRGB[0] = 0;     endRGB[1] = 120;   endRGB[2] = 160;
   } else if (co2 < 800) {
     startRGB[0] = 0;   startRGB[1] = 255; startRGB[2] = 255;
     endRGB[0] = 0;     endRGB[1] = 0;     endRGB[2] = 200;
@@ -212,43 +304,66 @@ static void lvFlushCb(lv_display_t *disp, const lv_area_t *area,
 // LVGL ANIMATION CALLBACKS
 // ============================================================
 
-// Set the radius (in px) of the glow's outer/transparent edge by moving the
-// end circle of the radial gradient, then invalidate so it re-renders.
-static void setGlowRadius(int32_t r) {
-  glowGrad.params.radial.end.x = GLOW_CX;
-  glowGrad.params.radial.end.y = GLOW_CY;
-  glowGrad.params.radial.end_extent.x = GLOW_CX + r;
-  glowGrad.params.radial.end_extent.y = GLOW_CY;
-  lv_obj_invalidate(glow);
-}
-
-// Tint the glow with a two-colour radial gradient: bright "start" colour at the
-// core, shifting to the "end" colour as it fades out at the edge. Only the
-// colours change here; the opacity ramp (cover -> mid -> transparent) is set
-// once in buildUI() and is what gives the soft breathing halo.
-static void setGlowColors(const uint8_t *startRGB, const uint8_t *endRGB) {
-  if (glowGrad.stops_count >= 3) {
-    glowGrad.stops[0].color =
-        lv_color_make(startRGB[0], startRGB[1], startRGB[2]);
-    glowGrad.stops[1].color = lv_color_make(endRGB[0], endRGB[1], endRGB[2]);
-    glowGrad.stops[2].color = lv_color_make(endRGB[0], endRGB[1], endRGB[2]);
-  }
-  lv_obj_invalidate(glow);
-}
-
-// THE breathing oscillator: a single stateless function of time, sampled by
-// BOTH the screen glow and the LED ring, so they pulse in sync by construction
-// (no shared mutable state, no cross-engine bridge). 0 -> 1 -> 0 (soft cosine)
-// over currentDurMs. Changing currentDurMs just changes the breathing rate.
+// THE breathing oscillator: a single stateless function of time so everything
+// that samples it pulses in sync by construction (no shared mutable state).
+// 0 -> 1 -> 0 (soft cosine) over currentDurMs; the rate is currentDurMs.
 float breathLevel() {
   float t = (float)(millis() % currentDurMs) / (float)currentDurMs;
   return 0.5f - 0.5f * cosf(t * 2.0f * (float)M_PI);
 }
 
-// LVGL timer (native scheduler): sample the oscillator and resize the glow.
+// Linear RGB interpolation between two colours (t = 0 -> a, t = 1 -> b).
+static lv_color_t lerpColor(const uint8_t *a, const uint8_t *b, float t) {
+  return lv_color_make((uint8_t)(a[0] + (b[0] - a[0]) * t),
+                       (uint8_t)(a[1] + (b[1] - a[1]) * t),
+                       (uint8_t)(a[2] + (b[2] - a[2]) * t));
+}
+
+// (Re)build the gradient stops so the colour goes from the bright "start"
+// colour at the core (frac 0) to the "end" colour at the rim, split into
+// RING_COUNT solid bands. Each band holds its colour, then a thin RING_RAMP
+// transition to the next -> distinct rings (not one smooth blend) while the
+// soft ramps keep the breathing fluid. The outermost band fades to transparent
+// so the whole target sits on black and the breath reads against it.
+static void recolorRings(const uint8_t *startRGB, const uint8_t *endRGB) {
+  int n = 0;
+  for (int k = 0; k < RING_COUNT; k++) {
+    float ct = (RING_COUNT > 1) ? (float)k / (RING_COUNT - 1) : 0.0f;
+    lv_color_t c = lerpColor(startRGB, endRGB, ct); // core=start, rim=end
+    int f0 = k * 255 / RING_COUNT;                  // band start
+    int f1 = (k < RING_COUNT - 1) ? ((k + 1) * 255 / RING_COUNT - RING_RAMP)
+                                  : 255;            // hold end (last fades out)
+    if (f1 < f0) f1 = f0;
+    glowGrad.stops[n].color = c;
+    glowGrad.stops[n].opa = LV_OPA_COVER;
+    glowGrad.stops[n].frac = (uint8_t)f0;
+    n++;
+    glowGrad.stops[n].color = c;
+    glowGrad.stops[n].opa =
+        (k == RING_COUNT - 1) ? LV_OPA_TRANSP : LV_OPA_COVER;
+    glowGrad.stops[n].frac = (uint8_t)f1;
+    n++;
+  }
+  glowGrad.stops_count = (uint8_t)n;
+  if (glow) lv_obj_invalidate(glow);
+}
+
+// Set the gradient radius (px) by moving the end circle of the radial gradient,
+// then invalidate. Animating this is what makes the banded target breathe --
+// the soft re-rasterisation keeps it fluid (no pixel stepping like geometry).
+static void setGlowRadius(int32_t r) {
+  glowGrad.params.radial.end.x = RING_CX;
+  glowGrad.params.radial.end.y = RING_CY;
+  glowGrad.params.radial.end_extent.x = RING_CX + r;
+  glowGrad.params.radial.end_extent.y = RING_CY;
+  if (glow) lv_obj_invalidate(glow);
+}
+
+// LVGL timer (native scheduler): sample the oscillator and breathe the radius.
 static void glowBreathCb(lv_timer_t *timer) {
   (void)timer;
-  setGlowRadius(GLOW_RMIN + (int32_t)(breathLevel() * (GLOW_RMAX - GLOW_RMIN)));
+  float scale = RING_SCALE_MIN + (1.0f - RING_SCALE_MIN) * breathLevel();
+  setGlowRadius((int32_t)(RING_GRAD_RMAX * scale));
 }
 
 // ============================================================
@@ -260,17 +375,14 @@ void buildUI() {
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-  // One full-screen object filled with a radial gradient: bright tinted core
-  // fading to transparent at the edge. Animating the gradient radius makes it
-  // breathe as a single soft mass (no discrete ring strokes).
-  static const lv_color_t gcol[3] = {
-      LV_COLOR_MAKE(0, 200, 255), LV_COLOR_MAKE(0, 200, 255),
-      LV_COLOR_MAKE(0, 200, 255)};
-  static const lv_opa_t gopa[3] = {LV_OPA_COVER, 150, LV_OPA_TRANSP};
-  lv_grad_init_stops(&glowGrad, gcol, gopa, NULL, 3);
-  lv_grad_radial_init(&glowGrad, GLOW_CX, GLOW_CY, GLOW_CX + GLOW_RMIN, GLOW_CY,
-                      LV_GRAD_EXTEND_PAD);
-  lv_grad_radial_set_focal(&glowGrad, GLOW_CX, GLOW_CY, 0);
+  // One full-screen object carrying the banded radial gradient. recolorRings()
+  // fills the stops; setGlowRadius() (driven by the breath timer) animates the
+  // gradient radius so the bands breathe. lv_grad_radial_init() sets the radial
+  // direction + extend mode; the focal at radius 0 makes concentric circles.
+  uint8_t s0[3] = {0, 200, 255}, e0[3] = {0, 0, 200}; // initial cyan->blue
+  lv_grad_radial_init(&glowGrad, RING_CX, RING_CY, RING_CX + RING_GRAD_RMAX,
+                      RING_CY, LV_GRAD_EXTEND_PAD);
+  lv_grad_radial_set_focal(&glowGrad, RING_CX, RING_CY, 0);
 
   lv_style_init(&glowStyle);
   lv_style_set_bg_grad(&glowStyle, &glowGrad);
@@ -279,6 +391,9 @@ void buildUI() {
   lv_style_set_radius(&glowStyle, 0);
   lv_style_set_pad_all(&glowStyle, 0);
 
+  // Create the object BEFORE filling the stops: recolorRings() invalidates
+  // `glow`, so it must already exist (invalidating a NULL object hard-faults
+  // the MCU and freezes setup() -- which is exactly what happened).
   glow = lv_obj_create(scr);
   lv_obj_remove_style_all(glow);
   lv_obj_add_style(glow, &glowStyle, 0);
@@ -287,7 +402,9 @@ void buildUI() {
   lv_obj_remove_flag(
       glow, (lv_obj_flag_t)(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
 
-  // Labels (created after rings so they render on top)
+  recolorRings(s0, e0); // fill the band stops (also invalidates glow)
+
+  // Labels (created after the gradient so they render on top)
   lblTitle = lv_label_create(scr);
   lv_obj_set_style_text_color(lblTitle, lv_color_white(), 0);
   lv_obj_set_style_text_font(lblTitle, &lv_font_montserrat_14, 0);
@@ -306,18 +423,33 @@ void buildUI() {
   lv_label_set_text(lblSub, "");
   lv_obj_align(lblSub, LV_ALIGN_CENTER, 0, 50);
 
-  // Drive the glow breathing from the shared oscillator via LVGL's scheduler.
-  lv_timer_create(glowBreathCb, 16, NULL); // ~60 fps
+  // Big glyph used by the WiFi connection screens (hidden the rest of the time).
+  lblIcon = lv_label_create(scr);
+  lv_obj_set_style_text_color(lblIcon, lv_color_white(), 0);
+  lv_obj_set_style_text_font(lblIcon, &lv_font_montserrat_48, 0);
+  lv_label_set_text(lblIcon, "");
+  lv_obj_align(lblIcon, LV_ALIGN_CENTER, 0, -46);
+
+  // Drive the ring breathing from the shared oscillator via LVGL's scheduler.
+  lv_timer_create(glowBreathCb, RING_FRAME_MS, NULL);
 }
 
-// Apply a CO2 theme: two-colour glow gradient on screen + LED breath colour +
-// breathing rate. start/end are the CO2 indicator colours.
+// Apply a CO2 theme: recolour the ring gradient on screen + LED breath colour +
+// breathing rate. start/end are the CO2 indicator colours (core -> rim).
 void applyTheme(const uint8_t *startRGB, const uint8_t *endRGB,
                 uint16_t durMs) {
-  setGlowColors(startRGB, endRGB);
+  recolorRings(startRGB, endRGB);
   // LED ring breathes from off to the dominant CO2 colour.
   ws2812fx.setColor(ws2812fx.Color(startRGB[0], startRGB[1], startRGB[2]));
   currentDurMs = durMs; // breathLevel() picks up the new rate immediately
+}
+
+// Animation setters used by the splash intro (LVGL animation engine).
+static void labelOpaAnimCb(void *obj, int32_t v) {
+  lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)v, 0);
+}
+static void labelScaleAnimCb(void *obj, int32_t v) {
+  lv_obj_set_style_transform_scale((lv_obj_t *)obj, v, 0); // 256 = 1.0x
 }
 
 void setStartupUI() {
@@ -325,11 +457,40 @@ void setStartupUI() {
   uint8_t e[3] = {0, 0, 200};
   applyTheme(s, e, 4000);
 
+  lv_obj_remove_flag(glow, LV_OBJ_FLAG_HIDDEN); // breathing rings back on
+  lv_anim_delete(lblIcon, NULL); // stop any leftover icon animation
+  lv_label_set_text(lblIcon, "");
   lv_label_set_text(lblTitle, "");
+  lv_label_set_text(lblSub, "");
+
   lv_obj_set_style_text_font(lblValue, &lv_font_montserrat_48, 0);
   lv_label_set_text(lblValue, "alba");
   lv_obj_align(lblValue, LV_ALIGN_CENTER, 0, 0);
-  lv_label_set_text(lblSub, "");
+
+  // Intro: "alba" materialises -- fade in + a gentle scale "pop". Scale around
+  // the label centre so it grows in place.
+  lv_obj_set_style_transform_pivot_x(lblValue, lv_pct(50), 0);
+  lv_obj_set_style_transform_pivot_y(lblValue, lv_pct(50), 0);
+  lv_obj_set_style_opa(lblValue, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_transform_scale(lblValue, 150, 0); // start ~0.6x
+
+  lv_anim_t fade;
+  lv_anim_init(&fade);
+  lv_anim_set_var(&fade, lblValue);
+  lv_anim_set_exec_cb(&fade, labelOpaAnimCb);
+  lv_anim_set_values(&fade, LV_OPA_TRANSP, LV_OPA_COVER);
+  lv_anim_set_duration(&fade, 900);
+  lv_anim_set_path_cb(&fade, lv_anim_path_ease_out);
+  lv_anim_start(&fade);
+
+  lv_anim_t pop;
+  lv_anim_init(&pop);
+  lv_anim_set_var(&pop, lblValue);
+  lv_anim_set_exec_cb(&pop, labelScaleAnimCb);
+  lv_anim_set_values(&pop, 150, 256);
+  lv_anim_set_duration(&pop, 1100);
+  lv_anim_set_path_cb(&pop, lv_anim_path_overshoot); // subtle bounce
+  lv_anim_start(&pop);
 }
 
 void setConfigUI() {
@@ -337,18 +498,27 @@ void setConfigUI() {
   uint8_t e[3] = {255, 0, 128};
   applyTheme(s, e, 4500);
 
+  lv_obj_remove_flag(glow, LV_OBJ_FLAG_HIDDEN); // breathing rings back on
+  // Small WiFi glyph crowning the config screen.
+  lv_anim_delete(lblIcon, NULL);
+  lv_obj_set_style_opa(lblIcon, LV_OPA_COVER, 0);
+  lv_obj_set_style_text_font(lblIcon, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_color(lblIcon, lv_color_white(), 0);
+  lv_label_set_text(lblIcon, LV_SYMBOL_WIFI);
+  lv_obj_align(lblIcon, LV_ALIGN_CENTER, 0, -66);
+
   lv_obj_set_style_text_font(lblTitle, &lv_font_montserrat_14, 0);
   lv_label_set_text(lblTitle, "Config WiFi");
-  lv_obj_align(lblTitle, LV_ALIGN_CENTER, 0, -40);
+  lv_obj_align(lblTitle, LV_ALIGN_CENTER, 0, -30);
 
   lv_obj_set_style_text_font(lblValue, &lv_font_montserrat_20, 0);
   lv_label_set_text(lblValue, apSSID.c_str());
-  lv_obj_align(lblValue, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_align(lblValue, LV_ALIGN_CENTER, 0, 6);
 
   lv_obj_set_style_text_font(lblSub, &lv_font_montserrat_14, 0);
   String ip = WiFi.softAPIP().toString();
   lv_label_set_text(lblSub, ip.c_str());
-  lv_obj_align(lblSub, LV_ALIGN_CENTER, 0, 36);
+  lv_obj_align(lblSub, LV_ALIGN_CENTER, 0, 40);
 }
 
 void updateCO2Label() {
@@ -356,6 +526,13 @@ void updateCO2Label() {
 }
 
 void setNormalUI() {
+  // Clear any leftover splash transform so the number shows full size/opacity.
+  lv_obj_set_style_opa(lblValue, LV_OPA_COVER, 0);
+  lv_obj_set_style_transform_scale(lblValue, 256, 0);
+
+  lv_obj_remove_flag(glow, LV_OBJ_FLAG_HIDDEN); // breathing rings back on
+  lv_anim_delete(lblIcon, NULL); // stop any leftover icon animation
+  lv_label_set_text(lblIcon, "");
   lv_label_set_text(lblTitle, "");
   lv_obj_set_style_text_font(lblValue, &lv_font_montserrat_48, 0);
   lv_obj_align(lblValue, LV_ALIGN_CENTER, 0, -4);
@@ -404,6 +581,124 @@ uint16_t breathSyncMode(void) {
 void updateLeds() {
   if (ledRingReady)
     ws2812fx.service();
+}
+
+// ============================================================
+// WIFI CONNECTION SCREENS (connecting / success / failure)
+// ============================================================
+
+// Keep the UI alive (LVGL + LED ring) for ms milliseconds, so the connect
+// animations actually play during the otherwise-blocking connection flow.
+static void uiHold(uint32_t ms) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms) {
+    lv_timer_handler();
+    updateLeds();
+    delay(5);
+  }
+}
+
+// "Connexion a <reseau>" screen: a big WiFi glyph gently pulsing (opacity
+// breathes) while we try to associate, with the target SSID underneath.
+void setConnectingUI(const String &ssid) {
+  // Drive only the LED ring blue here; the screen stays clean (no glow mass).
+  uint8_t s[3] = {0, 200, 255};
+  uint8_t e[3] = {0, 0, 200};
+  applyTheme(s, e, 2200);
+
+  // Clean black background: hide the breathing rings on this screen.
+  lv_obj_add_flag(glow, LV_OBJ_FLAG_HIDDEN);
+
+  lv_anim_delete(lblIcon, NULL);
+  lv_obj_set_style_text_font(lblIcon, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(lblIcon, lv_color_make(70, 170, 255), 0); // bleu
+  lv_obj_set_style_opa(lblIcon, LV_OPA_COVER, 0);
+  lv_label_set_text(lblIcon, LV_SYMBOL_WIFI);
+  lv_obj_align(lblIcon, LV_ALIGN_CENTER, 0, -44);
+
+  // Pulse the glyph's opacity in a loop to signal an in-progress attempt.
+  lv_anim_t pulse;
+  lv_anim_init(&pulse);
+  lv_anim_set_var(&pulse, lblIcon);
+  lv_anim_set_exec_cb(&pulse, labelOpaAnimCb);
+  lv_anim_set_values(&pulse, 70, 255);
+  lv_anim_set_duration(&pulse, 700);
+  lv_anim_set_playback_duration(&pulse, 700);
+  lv_anim_set_repeat_count(&pulse, LV_ANIM_REPEAT_INFINITE);
+  lv_anim_start(&pulse);
+
+  lv_obj_set_style_text_font(lblTitle, &lv_font_montserrat_14, 0);
+  lv_label_set_text(lblTitle, "Connexion a");
+  lv_obj_align(lblTitle, LV_ALIGN_CENTER, 0, 14);
+
+  lv_obj_set_style_opa(lblValue, LV_OPA_COVER, 0);
+  lv_obj_set_style_transform_scale(lblValue, 256, 0);
+  lv_obj_set_style_text_font(lblValue, &lv_font_montserrat_20, 0);
+  lv_label_set_text(lblValue, ssid.c_str());
+  lv_obj_align(lblValue, LV_ALIGN_CENTER, 0, 44);
+
+  lv_label_set_text(lblSub, "");
+}
+
+// Success / failure screen: green check or red cross, animated in with a
+// little "pop", held on screen for a moment so the outcome is unmistakable.
+void showConnectResult(bool ok, const String &ssid) {
+  // Colour only the LED ring (green/red); the screen stays clean black.
+  if (ok) {
+    uint8_t s[3] = {60, 255, 120};
+    uint8_t e[3] = {0, 180, 90};
+    applyTheme(s, e, 3500);
+  } else {
+    uint8_t s[3] = {255, 70, 70};
+    uint8_t e[3] = {200, 0, 0};
+    applyTheme(s, e, 3500);
+  }
+
+  // Clean black background: no breathing rings behind the verdict.
+  lv_obj_add_flag(glow, LV_OBJ_FLAG_HIDDEN);
+
+  lv_anim_delete(lblIcon, NULL); // stop the connecting pulse
+  lv_obj_set_style_opa(lblIcon, LV_OPA_COVER, 0);
+  lv_obj_set_style_text_font(lblIcon, &lv_font_montserrat_48, 0);
+  // Check vert, croix rouge.
+  lv_obj_set_style_text_color(
+      lblIcon, ok ? lv_color_make(60, 230, 130) : lv_color_make(255, 80, 80), 0);
+  lv_label_set_text(lblIcon, ok ? LV_SYMBOL_OK : LV_SYMBOL_CLOSE);
+  lv_obj_align(lblIcon, LV_ALIGN_CENTER, 0, -44);
+
+  lv_obj_set_style_text_font(lblTitle, &lv_font_montserrat_14, 0);
+  lv_label_set_text(lblTitle, ok ? "Connecte" : "Echec WiFi");
+  lv_obj_align(lblTitle, LV_ALIGN_CENTER, 0, 14);
+
+  lv_obj_set_style_opa(lblValue, LV_OPA_COVER, 0);
+  lv_obj_set_style_text_font(lblValue, &lv_font_montserrat_20, 0);
+  lv_label_set_text(lblValue, ssid.c_str());
+  lv_obj_align(lblValue, LV_ALIGN_CENTER, 0, 44);
+
+  lv_obj_set_style_text_font(lblSub, &lv_font_montserrat_14, 0);
+  if (ok) {
+    lv_label_set_text(lblSub, WiFi.localIP().toString().c_str());
+    lv_obj_align(lblSub, LV_ALIGN_CENTER, 0, 70);
+  } else {
+    lv_label_set_text(lblSub, "");
+  }
+
+  // "Pop" the icon in (scale overshoot) so the verdict lands with a flourish.
+  lv_obj_set_style_transform_pivot_x(lblIcon, lv_pct(50), 0);
+  lv_obj_set_style_transform_pivot_y(lblIcon, lv_pct(50), 0);
+  lv_obj_set_style_transform_scale(lblIcon, 80, 0);
+  lv_anim_t pop;
+  lv_anim_init(&pop);
+  lv_anim_set_var(&pop, lblIcon);
+  lv_anim_set_exec_cb(&pop, labelScaleAnimCb);
+  lv_anim_set_values(&pop, 80, 256);
+  lv_anim_set_duration(&pop, 600);
+  lv_anim_set_path_cb(&pop, lv_anim_path_overshoot);
+  lv_anim_start(&pop);
+
+  uiHold(ok ? 1800 : 2200); // let the user read the outcome
+  lv_anim_delete(lblIcon, NULL);
+  lv_obj_set_style_transform_scale(lblIcon, 256, 0);
 }
 
 // ============================================================
@@ -470,8 +765,12 @@ bool deleteWifiConfig() {
 // WIFI CONNECTION
 // ============================================================
 
+// Blocking STA connect used at boot. Keeps the splash animation + LED ring
+// alive while waiting (the loop pumps LVGL), unlike a bare delay(). Returns
+// true on association within timeoutMs. The caller decides what to do on
+// failure (scan + retry, or AP fallback).
 bool connectToWifi(const String &ssid, const String &password,
-                   int timeoutMs = 10000) {
+                   int timeoutMs = WIFI_CONNECT_TIMEOUT_MS) {
   Serial.printf("Connecting to WiFi: %s\n", ssid.c_str());
 
   WiFi.mode(WIFI_STA);
@@ -492,6 +791,29 @@ bool connectToWifi(const String &ssid, const String &password,
   Serial.println("WiFi connection failed");
   WiFi.disconnect();
   return false;
+}
+
+// Scan in STA mode and report whether the given SSID is currently visible.
+// ModuleAir's fallback hinge: after a failed connect we only bother retrying
+// if the network is actually around -- otherwise (AP off, device moved) we go
+// straight to config mode instead of burning a second 15 s timeout.
+bool wifiSsidIsVisible(const String &ssid) {
+  Serial.printf("[WiFi] Scanning to check if '%s' is around...\n",
+                ssid.c_str());
+  WiFi.mode(WIFI_STA);
+  int n = WiFi.scanNetworks();
+  bool found = false;
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) == ssid) {
+      found = true;
+      Serial.printf("[WiFi] SSID found in scan (RSSI %d dBm)\n", WiFi.RSSI(i));
+      break;
+    }
+  }
+  WiFi.scanDelete();
+  if (!found)
+    Serial.println("[WiFi] SSID not found in scan");
+  return found;
 }
 
 // ============================================================
@@ -538,6 +860,8 @@ void pollCO2() {
         uint16_t c = (r[2] << 8) | r[3];
         if (c > 300 && c < 5000) {
           co2Value = c;
+          co2Sum += c; // feed the upload-window average (reset on each send)
+          co2SampleCount++;
           onCO2Updated();
         }
 #if CO2_DEBUG
@@ -767,18 +1091,36 @@ void registerRoutes() {
 // MODE TRANSITIONS
 // ============================================================
 
-void startConfigMode() {
-  Serial.println("Entering configuration mode (WiFi AP)...");
-  currentMode = MODE_CONFIG;
+// Record a WiFi FSM transition (and reset the per-state timer the FSM reads).
+void setWifiState(WifiState s) {
+  wifiState = s;
+  stateEnteredAt = millis();
+}
 
-  // 1) Scan available networks in STA mode first, cache the list for the page.
+// Start the HTTP server once. Routes are registered a single time; the server
+// listens on whatever interface(s) are up (AP, STA, or both in AP+STA), so one
+// begin() serves the captive portal and the LAN status page alike.
+void startWebServer() {
+  if (!routesRegistered) {
+    registerRoutes();
+    routesRegistered = true;
+  }
+  if (!serverStarted) {
+    server.begin();
+    serverStarted = true;
+    Serial.println("[Web] HTTP server started");
+  }
+}
+
+// Bring up the open configuration Access-Point + captive portal. A fresh STA
+// scan is cached first for the portal's network list (a live scan is unreliable
+// once the radio is in AP mode).
+void apStart() {
   Serial.println("[WiFi] Scanning networks before AP...");
   WiFi.mode(WIFI_STA);
   cachedScanJson = scanToJson();
   Serial.printf("[WiFi] Scan done (%d bytes)\n", cachedScanJson.length());
 
-  // 2) Bring up an open Access-Point only (reliable on the cyw43; AP+STA is
-  //    flaky and can leave the SSID invisible).
   IPAddress apIP(AP_IP_OCT_1, AP_IP_OCT_2, AP_IP_OCT_3, AP_IP_OCT_4);
   IPAddress subnet(255, 255, 255, 0);
   WiFi.mode(WIFI_AP);
@@ -790,26 +1132,265 @@ void startConfigMode() {
   Serial.printf("[AP] IP: %s\n", WiFi.softAPIP().toString().c_str());
 
   dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
-  registerRoutes();
-  server.begin();
-  Serial.println("[Web] HTTP server started");
-
-  setConfigUI();
+  startWebServer();
 }
 
-void startNormalMode() {
-  Serial.println("Entering normal mode...");
+// Switch the DISPLAY to the live ppm readout. Idempotent: a no-op if already
+// showing it (used both when the config splash expires and when STA connects).
+void showNormalDisplay() {
+  if (currentMode == MODE_NORMAL)
+    return;
   currentMode = MODE_NORMAL;
-
-#if !SKIP_WIFI
-  registerRoutes();
-  server.begin();
-  Serial.printf("[Web] Status page at http://%s/\n",
-                WiFi.localIP().toString().c_str());
-#endif
-
   setNormalUI();
   lastCO2Request = millis();
+}
+
+// We are associated to a known network: serve the LAN status page and show ppm.
+void enterStaConnected() {
+  Serial.printf("[WiFi] STA connected, IP %s\n",
+                WiFi.localIP().toString().c_str());
+  startWebServer();
+  showNormalDisplay();
+  // Schedule the first upload ~DATA_WARMUP_MS from now (not a full interval),
+  // so a freshly (re)connected device reports quickly.
+  lastDataSend = millis() - (DATA_SEND_INTERVAL - DATA_WARMUP_MS);
+  setWifiState(WS_STA_CONNECTED);
+}
+
+// AP fallback: raise the config hotspot and show the "Config WiFi" screen.
+void startConfigMode() {
+  Serial.println("Entering configuration mode (WiFi AP)...");
+  apStart();
+  currentMode = MODE_CONFIG;
+  setConfigUI();
+  setWifiState(WS_AP_CONFIG);
+}
+
+// Every 10 min while in AP-data mode, try to rejoin the saved network WITHOUT
+// dropping the hotspot, using concurrent AP+STA. Mirrors ModuleAir_V4.
+void attemptBackgroundReconnect() {
+  if (storedSSID.length() == 0) {
+    setWifiState(WS_AP_DATA); // nothing saved; just re-arm the 10-min timer
+    return;
+  }
+  Serial.printf("[WiFi] Background reconnect to '%s' (AP stays up)...\n",
+                storedSSID.c_str());
+  WiFi.mode(WIFI_AP_STA); // concurrent: keep the config hotspot, add a STA link
+  WiFi.begin(storedSSID.c_str(), storedPassword.c_str());
+  setWifiState(WS_AP_RETRYING);
+}
+
+// True whenever the config hotspot is up (so the loop keeps serving DNS + web).
+bool isApActive() {
+  return wifiState == WS_AP_CONFIG || wifiState == WS_AP_DATA ||
+         wifiState == WS_AP_RETRYING;
+}
+
+// The WiFi connection state machine, ticked at 1 Hz from loop(). This is the
+// ModuleAir_V4 mechanic, adapted to the arduino-pico WiFi API.
+void wifiManagerLoop() {
+  static unsigned long lastTick = 0;
+  unsigned long now = millis();
+  if (now - lastTick < 1000)
+    return;
+  lastTick = now;
+
+  switch (wifiState) {
+  case WS_STA_CONNECTED:
+    // Detect a dropped link and start the 3-minute recovery window.
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[WiFi] STA link lost -> reconnecting");
+      WiFi.begin(storedSSID.c_str(), storedPassword.c_str());
+      lastReconnectKickAt = now;
+      setWifiState(WS_STA_RECONNECTING);
+    }
+    break;
+
+  case WS_STA_RECONNECTING:
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("[WiFi] Reconnected (RSSI %d dBm)\n", WiFi.RSSI());
+      setWifiState(WS_STA_CONNECTED);
+    } else if (now - stateEnteredAt > STA_RECONNECT_WINDOW_MS) {
+      // 3 min without recovery: fall back to the config hotspot.
+      Serial.println("[WiFi] 3 min reconnect window expired -> AP fallback");
+      WiFi.disconnect();
+      startConfigMode();
+    } else if (now - lastReconnectKickAt > STA_RECONNECT_KICK_MS) {
+      // Re-kick the driver every 30 s in case its auto-retry backed off.
+      Serial.println("[WiFi] still reconnecting (kick)");
+      WiFi.begin(storedSSID.c_str(), storedPassword.c_str());
+      lastReconnectKickAt = now;
+    }
+    break;
+
+  case WS_AP_CONFIG:
+    // After 3 min on the "Config WiFi" splash, switch the screen to ppm. The
+    // hotspot keeps running so the user can still configure it.
+    if (now - stateEnteredAt > AP_CONFIG_DURATION_MS) {
+      Serial.println("[WiFi] 3 min in config -> show ppm (AP stays up)");
+      showNormalDisplay();
+      setWifiState(WS_AP_DATA);
+    }
+    break;
+
+  case WS_AP_DATA:
+    // Every 10 min, attempt to rejoin the saved network in the background.
+    if (now - stateEnteredAt > AP_RETRY_INTERVAL_MS)
+      attemptBackgroundReconnect();
+    break;
+
+  case WS_AP_RETRYING:
+    if (WiFi.status() == WL_CONNECTED) {
+      // Joined: tear the hotspot down cleanly and go STA-only.
+      Serial.println("[WiFi] Background reconnect SUCCEEDED -> tearing down AP");
+      delay(300); // let any in-flight HTTP response flush over the AP
+      dnsServer.stop();
+      WiFi.softAPdisconnect(true);
+      WiFi.mode(WIFI_STA);
+      enterStaConnected();
+    } else if (now - stateEnteredAt > AP_RETRY_TIMEOUT_MS) {
+      // 30 s and still no association: drop the STA half, keep the AP, and
+      // re-arm the 10-minute timer for the next try.
+      Serial.println(
+          "[WiFi] Background reconnect timed out -> AP only, retry in 10 min");
+      WiFi.mode(WIFI_AP);
+      setWifiState(WS_AP_DATA);
+    }
+    break;
+  }
+}
+
+// ============================================================
+// DEVICE IDENTITY
+// ============================================================
+
+// Loud, unmistakable identity banner. TOKEN is the value to register on the
+// AirCarto side (capteurs.capteurs.token). Printed at boot and on demand (type
+// 'i' or 't' in the serial monitor) so it's always reachable even after the
+// boot logs have scrolled away.
+void printIdentity() {
+  Serial.println();
+  Serial.println("==================================================");
+  Serial.println("  ALBA  -  identite du capteur (a enregistrer)");
+  Serial.println("--------------------------------------------------");
+  Serial.printf("  MAC        : %s%s\n", deviceMac.c_str(),
+                tokenFromChipId ? "  (indispo -> chip id)" : "");
+  Serial.printf("  TOKEN      : %s   <== a entrer cote serveur\n",
+                deviceToken.c_str());
+  Serial.printf("  device_id  : %s\n", deviceIdHex.c_str());
+  Serial.printf("  SSID AP    : %s\n", apSSID.c_str());
+  Serial.println("==================================================");
+  Serial.println();
+}
+
+// ============================================================
+// DATA UPLOAD (POST a measurement to the AirCarto Alba endpoint)
+// ============================================================
+
+// Encode an ASCII string as a hex string (each byte -> two uppercase hex
+// digits). The endpoint recovers the token with PHP pack('H*', device_id), so
+// the token must stay printable ASCII (it is -- it's the MAC as a hex string).
+static String asciiToHex(const String &s) {
+  String out;
+  out.reserve(s.length() * 2);
+  char b[3];
+  for (size_t i = 0; i < s.length(); i++) {
+    snprintf(b, sizeof(b), "%02X", (uint8_t)s[i]);
+    out += b;
+  }
+  return out;
+}
+
+// Build the JSON body and POST it to DATA_SERVER_URL over HTTPS. Blocking (a
+// few seconds incl. the TLS handshake), so the breathing animation pauses for
+// the duration -- acceptable once a minute. Only call this while STA-connected.
+void dataSenderSend() {
+  int vMajor = 0, vMinor = 0, vPatch = 0;
+  sscanf(FIRMWARE_VERSION, "%d.%d.%d", &vMajor, &vMinor, &vPatch);
+
+  // Average of every valid reading taken since the last send (ModuleAir-Next-Gen
+  // behaviour): integer mean = sum / count. -1 if the window had no valid sample
+  // (the endpoint treats -1 as "not available"). Snapshot + reset the window
+  // here so readings taken during the upload itself count toward the next one.
+  int co2Avg = (co2SampleCount > 0) ? (int)(co2Sum / co2SampleCount) : -1;
+  uint16_t samples = co2SampleCount;
+  co2Sum = 0;
+  co2SampleCount = 0;
+
+  // Flat payload, exactly the fields api.aircarto.fr/capteurs/alba.php reads.
+  // No GPS (no receiver) and no timestamp (no RTC) -> omitted; the server then
+  // stamps the reading with its reception time, which the endpoint supports.
+  String json = "{";
+  json += "\"device_id\":\"" + deviceIdHex + "\"";
+  json += ",\"signal_quality\":" + String(WiFi.RSSI());
+  json += ",\"version\":" + String(PROTOCOL_VERSION);
+  json += ",\"co2\":" + String(co2Avg);
+  json += ",\"version_major\":" + String(vMajor);
+  json += ",\"version_minor\":" + String(vMinor);
+  json += ",\"version_patch\":" + String(vPatch);
+  json += "}";
+
+  Serial.printf("[Data] co2 moyenne=%d ppm sur %u echantillon(s) (live=%u)\n",
+                co2Avg, samples, co2Value);
+
+  // Raw HTTP/1.1 request built by hand over the TLS socket, so we can dump the
+  // EXACT bytes sent and the EXACT bytes received (status line + every header +
+  // body), verbatim, for debugging -- no library filtering, no interpretation.
+  const char *host = "api.aircarto.fr";
+  const char *path = "/capteurs/alba.php";
+  const uint16_t port = 443;
+
+  String req = String("POST ") + path + " HTTP/1.1\r\n";
+  req += "Host: " + String(host) + "\r\n";
+  req += "User-Agent: alba/" FIRMWARE_VERSION "\r\n";
+  req += "Content-Type: application/json\r\n";
+  req += "Content-Length: " + String(json.length()) + "\r\n";
+  req += "Connection: close\r\n";
+  req += "\r\n";
+  req += json;
+
+  Serial.println();
+  Serial.println("================ REQUETE (brut) ================");
+  Serial.print(req);
+  Serial.println();
+  Serial.println("================================================");
+
+  WiFiClientSecure client;
+  client.setInsecure(); // skip cert validation (mirrors ModuleAir_V4)
+  client.setTimeout(12000);
+
+  unsigned long t0 = millis();
+  if (!client.connect(host, port)) {
+    Serial.printf("[Data] connexion TLS %s:%u ECHOUEE (%.1fs)\n", host, port,
+                  (millis() - t0) / 1000.0f);
+    client.stop();
+    return;
+  }
+  client.print(req);
+
+  // Dump the raw response exactly as it arrives, until the server closes the
+  // connection (Connection: close) or we hit the safety timeout.
+  Serial.println("================ REPONSE (brut) ================");
+  size_t nbytes = 0;
+  unsigned long lastRx = millis();
+  while (true) {
+    while (client.available()) {
+      Serial.write(client.read());
+      nbytes++;
+      lastRx = millis();
+    }
+    if (!client.connected() && !client.available())
+      break; // server closed and buffer drained
+    if (millis() - lastRx > 12000) {
+      Serial.println("\n[Data] (timeout lecture reponse)");
+      break;
+    }
+    delay(1);
+  }
+  client.stop();
+  Serial.println();
+  Serial.printf("=========== fin reponse (%u octets, %.1fs) ===========\n",
+                (unsigned)nbytes, (millis() - t0) / 1000.0f);
 }
 
 // ============================================================
@@ -818,8 +1399,6 @@ void startNormalMode() {
 
 static unsigned long startupStart = 0;
 static bool startupSensorSeen = false;
-static unsigned long startupFirstSeen = 0;
-static uint16_t startupPrevCO2 = 0;
 
 void finishStartup() {
   if (co2Value == 0) {
@@ -830,18 +1409,41 @@ void finishStartup() {
 
 #if SKIP_WIFI
   Serial.println("WiFi disabled (SKIP_WIFI) -> live CO2 display");
-  startNormalMode();
+  showNormalDisplay();
   return;
 #else
+  // ModuleAir_V4 startup mechanic:
+  //   stored SSID? -> try to join (attempt 1)
+  //     fail -> is the SSID visible in a scan?
+  //       yes -> retry once (attempt 2)
+  //       no  -> config hotspot
+  //   no stored SSID -> config hotspot
   if (loadWifiCredentials()) {
-    Serial.println("Stored credentials found, connecting...");
-    if (connectToWifi(storedSSID, storedPassword, 10000)) {
-      startNormalMode();
+    Serial.printf("[WiFi] Stored SSID '%s', attempt 1/%d\n", storedSSID.c_str(),
+                  WIFI_MAX_ATTEMPTS);
+    setConnectingUI(storedSSID); // "Connexion a <reseau>" + pulsing WiFi glyph
+    if (connectToWifi(storedSSID, storedPassword)) {
+      showConnectResult(true, storedSSID); // green check, held a moment
+      enterStaConnected();
       return;
     }
-    Serial.println("Stored WiFi failed, entering config mode");
+    if (wifiSsidIsVisible(storedSSID)) {
+      Serial.printf("[WiFi] SSID visible, retry (attempt 2/%d)\n",
+                    WIFI_MAX_ATTEMPTS);
+      setConnectingUI(storedSSID);
+      if (connectToWifi(storedSSID, storedPassword)) {
+        showConnectResult(true, storedSSID);
+        enterStaConnected();
+        return;
+      }
+      Serial.println("[WiFi] retry failed -> config mode");
+    } else {
+      Serial.println("[WiFi] SSID not around -> config mode");
+    }
+    // Tried and failed: show the red verdict before dropping into config.
+    showConnectResult(false, storedSSID);
   } else {
-    Serial.println("No stored WiFi credentials, entering config mode");
+    Serial.println("[WiFi] No stored credentials -> config mode");
   }
   startConfigMode();
 #endif
@@ -850,34 +1452,24 @@ void finishStartup() {
 // Called by pollCO2() whenever a fresh, valid reading lands.
 void onCO2Updated() {
   if (currentMode == MODE_STARTUP) {
+    // Just note the first reading; the splash runs for a fixed, short time so
+    // the intro animation always plays fully (the sensor keeps warming up and
+    // its value is shown live once we switch to the normal display).
     if (!startupSensorSeen) {
       startupSensorSeen = true;
-      startupFirstSeen = millis();
-      startupPrevCO2 = co2Value;
       Serial.printf("First valid reading: %d ppm\n", co2Value);
-      return;
     }
-    if (co2Value != startupPrevCO2) {
-      Serial.printf("Sensor ready: %d -> %d ppm\n", startupPrevCO2, co2Value);
-      finishStartup();
-      return;
-    }
-    if (millis() - startupFirstSeen > 15000) {
-      Serial.println("15s stable reading, proceeding...");
-      finishStartup();
-      return;
-    }
-    startupPrevCO2 = co2Value;
   } else if (currentMode == MODE_NORMAL) {
     Serial.printf("CO2: %d ppm\n", co2Value);
     refreshNormal();
   }
 }
 
-// Only responsibility left here: the overall startup timeout.
+// Leave the splash after a fixed, short duration (lets the intro play, then
+// switches to the live display - no lingering on the boot screen).
 void handleStartup() {
-  if (millis() - startupStart > 30000) {
-    Serial.println("Startup timeout, proceeding...");
+  if (millis() - startupStart > SPLASH_MS) {
+    Serial.println("Splash done, switching to live display...");
     finishStartup();
   }
 }
@@ -892,6 +1484,9 @@ void checkSerialReset() {
     if (cmd == 'r' || cmd == 'R') {
       Serial.println("\n*** RESET WiFi Configuration ***");
       deleteWifiConfig();
+    } else if (cmd == 'i' || cmd == 'I' || cmd == 't' || cmd == 'T') {
+      // Reprint the identity banner on demand (token to register server-side).
+      printIdentity();
     }
   }
 }
@@ -939,13 +1534,35 @@ void setup() {
     LittleFS.begin();
   }
 
-  // Derive device id / AP SSID from the board's unique chip id (a hex string,
-  // valid this early in setup unlike WiFi.macAddress() which needs the radio).
-  String fullId = String(rp2040.getChipID());
-  chipId = fullId.substring(fullId.length() >= 6 ? fullId.length() - 6 : 0);
-  chipId.toUpperCase();
-  apSSID = "alba-" + chipId;
-  Serial.printf("Device: %s\n", apSSID.c_str());
+  // Derive the device token / AP SSID / device_id from the WiFi MAC, the same
+  // way ModuleAir derives its id from the MAC. The token is the MAC as an
+  // uppercase hex string (printable), which is what gets registered server-side
+  // and shown in the SSID ("alba-<token>"); device_id is its ASCII-hex encoding.
+#if !SKIP_WIFI
+  WiFi.mode(WIFI_STA); // bring the cyw43 up so the MAC is readable
+  uint8_t mac[6] = {0};
+  WiFi.macAddress(mac);
+  char macHex[13];
+  snprintf(macHex, sizeof(macHex), "%02X%02X%02X%02X%02X%02X", mac[0], mac[1],
+           mac[2], mac[3], mac[4], mac[5]);
+  deviceToken = String(macHex);
+  char macColon[18];
+  snprintf(macColon, sizeof(macColon), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0],
+           mac[1], mac[2], mac[3], mac[4], mac[5]);
+  deviceMac = String(macColon);
+#endif
+  // Fallback to the flash chip id if the MAC is unavailable (radio off / no
+  // radio): keep a stable, unique-per-board token either way.
+  if (deviceToken.length() == 0 || deviceToken == "000000000000") {
+    String fullId = String(rp2040.getChipID());
+    deviceToken = fullId.length() >= 12 ? fullId.substring(fullId.length() - 12)
+                                        : fullId;
+    deviceToken.toUpperCase();
+    tokenFromChipId = true;
+  }
+  apSSID = "alba-" + deviceToken;
+  deviceIdHex = asciiToHex(deviceToken);
+  printIdentity();
 
   // --- LVGL ---
   lv_init();
@@ -982,25 +1599,29 @@ void loop() {
     lastCO2Request = millis();
   }
 
-  switch (currentMode) {
-  case MODE_STARTUP:
+  if (currentMode == MODE_STARTUP) {
     handleStartup();
-    break;
-
-  case MODE_CONFIG:
+  } else {
 #if !SKIP_WIFI
-    dnsServer.processNextRequest();
-    server.handleClient();
+    // Drive the WiFi connection state machine (connect/scan/retry/AP/reconnect)
+    // and serve the captive portal / status page for whichever links are up.
+    wifiManagerLoop();
+    if (serverStarted) {
+      if (isApActive())
+        dnsServer.processNextRequest(); // captive portal only while the AP is up
+      server.handleClient();
+    }
     checkSerialReset();
-#endif
-    break;
 
-  case MODE_NORMAL:
-#if !SKIP_WIFI
-    server.handleClient();
-    checkSerialReset();
+    // Upload a measurement every DATA_SEND_INTERVAL while STA-connected. (In
+    // AP-only mode there is no uplink, so nothing is sent.) The POST blocks for
+    // a few seconds, briefly pausing the animation -- fine once a minute.
+    if (WiFi.status() == WL_CONNECTED &&
+        millis() - lastDataSend >= DATA_SEND_INTERVAL) {
+      lastDataSend = millis();
+      dataSenderSend();
+    }
 #endif
-    break;
   }
 
   delay(5);

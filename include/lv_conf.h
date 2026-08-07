@@ -34,7 +34,7 @@
    RENDERING
  *========================*/
 #define LV_USE_DRAW_SW_COMPLEX_GRADIENTS 1 /* enable radial gradients */
-#define LV_GRADIENT_MAX_STOPS 4
+#define LV_GRADIENT_MAX_STOPS 20 /* concentric colour bands = ~2 stops/ring */
 
 /*=======================
    LOG / DEBUG
